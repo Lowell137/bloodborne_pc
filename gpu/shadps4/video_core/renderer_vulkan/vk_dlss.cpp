@@ -17,8 +17,12 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include "../../../dlss_bridge/bbport_dlss_bridge.h"
+#else
+#include <dlfcn.h>
+#include <unistd.h>
+using HMODULE = void*;
 #endif
+#include "../../../dlss_bridge/bbport_dlss_bridge.h"
 
 namespace Vulkan {
 
@@ -27,17 +31,30 @@ int Dlss::QualityForScale(float scale) {
     return scale >= 2.9f ? 4 : scale >= 1.95f ? 3 : scale >= 1.65f ? 2 : scale > 1.01f ? 1 : 0;
 }
 
-#ifdef _WIN32
-
 namespace {
+#ifdef _WIN32
 constexpr wchar_t BridgeName[] = L"bbport_dlss.dll";
 constexpr wchar_t NgxName[] = L"nvngx_dlss.dll";
+#else
+constexpr char BridgeName[] = "libbbport_dlss.so";
+constexpr char NgxName[] = "libnvidia-ngx-dlss.so";
+#endif
 
 std::filesystem::path ExecutableDirectory() {
+#ifdef _WIN32
     std::wstring path(MAX_PATH, L'\0');
     const DWORD length = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
     path.resize(length);
     return std::filesystem::path{path}.parent_path();
+#else
+    char buf[1024];
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (len > 0) {
+        buf[len] = '\0';
+        return std::filesystem::path{buf}.parent_path();
+    }
+    return std::filesystem::current_path();
+#endif
 }
 
 void BridgeLog(int warning, const char* message) {
@@ -91,8 +108,17 @@ Dlss* Dlss::Get() {
             return nullptr;
         }
         const auto directory = ExecutableDirectory();
-        if (!std::filesystem::is_regular_file(directory / BridgeName) ||
-            !std::filesystem::is_regular_file(directory / NgxName)) {
+        bool found = false;
+        for (const auto& dir : {directory, directory / "gpu", std::filesystem::current_path(),
+                                std::filesystem::current_path() / "out",
+                                std::filesystem::current_path() / "out/gpu",
+                                std::filesystem::current_path() / "bin/gpu"}) {
+            if (std::filesystem::is_regular_file(dir / BridgeName)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
             return nullptr;
         }
         auto* created = new Dlss;
@@ -109,23 +135,44 @@ Dlss* Dlss::Get() {
 
 Dlss::Dlss() : impl{std::make_unique<Impl>()} {
     const auto directory = ExecutableDirectory();
-    impl->module = LoadLibraryW((directory / BridgeName).c_str());
+    std::filesystem::path bridge_path = directory / BridgeName;
+    std::filesystem::path search_dir = directory;
+    for (const auto& dir : {directory, directory / "gpu", std::filesystem::current_path(),
+                            std::filesystem::current_path() / "out",
+                            std::filesystem::current_path() / "out/gpu",
+                            std::filesystem::current_path() / "bin/gpu"}) {
+        if (std::filesystem::is_regular_file(dir / BridgeName)) {
+            bridge_path = dir / BridgeName;
+            search_dir = dir;
+            break;
+        }
+    }
+#ifdef _WIN32
+    impl->module = LoadLibraryW(bridge_path.c_str());
     const auto get_api =
         impl->module ? reinterpret_cast<BbDlssGetApiFn>(GetProcAddress(impl->module, "BbDlssGetApi"))
                      : nullptr;
+#else
+    impl->module = dlopen(bridge_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    const auto get_api =
+        impl->module ? reinterpret_cast<BbDlssGetApiFn>(dlsym(impl->module, "BbDlssGetApi"))
+                     : nullptr;
+#endif
     impl->api = get_api ? get_api() : nullptr;
     if (!impl->api || impl->api->abi != BBPORT_DLSS_BRIDGE_ABI) {
-        impl->Disable("bbport_dlss.dll is missing or from another version");
+        impl->Disable("bbport_dlss is missing or from another version");
         return;
     }
     // NGX writes its logs and model updates here: beside the saves and shader caches.
-    std::filesystem::path data = directory / "dlss";
+    std::filesystem::path data = search_dir / "dlss";
     if (const char* user = std::getenv("BB_GPU_USER_DIR"); user && user[0]) {
         data = std::filesystem::path{user} / "dlss";
     }
     std::error_code error;
     std::filesystem::create_directories(data, error);
-    if (!impl->api->Configure(directory.c_str(), data.c_str(), BridgeLog)) {
+    std::wstring wsearch = search_dir.wstring();
+    std::wstring wdata = data.wstring();
+    if (!impl->api->Configure(wsearch.c_str(), wdata.c_str(), BridgeLog)) {
         impl->Disable("bridge configuration failed");
     }
 }
@@ -262,41 +309,14 @@ void Dlss::Shutdown() {
         impl->api->Shutdown();
         impl->initialized = false;
     }
-}
-
+    if (impl->module) {
+#ifdef _WIN32
+        FreeLibrary(impl->module);
 #else
-
-struct Dlss::Impl {};
-bool Dlss::FrameGenerationAvailable() const { return false; }
-bool Dlss::CreateFrameGeneration(vk::CommandBuffer, u32, u32, vk::Format) { return false; }
-bool Dlss::GenerateFrame(vk::CommandBuffer, const BbDlssGenerate &) { return false; }
-void Dlss::ReleaseFrameGeneration() {}
-Dlss::Dlss() = default;
-Dlss::~Dlss() = default;
-Dlss* Dlss::Get() {
-    return nullptr;
-}
-void Dlss::AppendInstanceExtensions(std::vector<const char*>&) {}
-void Dlss::AppendDeviceExtensions(vk::Instance, vk::PhysicalDevice, std::vector<const char*>&) {}
-void Dlss::Initialize(vk::Instance, vk::PhysicalDevice, vk::Device) {}
-void Dlss::Shutdown() {}
-bool Dlss::Available() const {
-    return false;
-}
-std::string Dlss::Problem() const {
-    return {};
-}
-bool Dlss::HasFeature(const FeatureDesc&) const {
-    return false;
-}
-bool Dlss::CreateFeature(vk::CommandBuffer, const FeatureDesc&) {
-    return false;
-}
-bool Dlss::Evaluate(vk::CommandBuffer, const Frame&) {
-    return false;
-}
-void Dlss::ReleaseFeature() {}
-
+        dlclose(impl->module);
 #endif
+        impl->module = nullptr;
+    }
+}
 
 } // namespace Vulkan

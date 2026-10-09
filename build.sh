@@ -83,8 +83,8 @@ for patch in gpu/patches/fsr-vulkan/*.patch; do
         git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
     fi
 done
-cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
-    -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" >/dev/null
+cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_PREFIX_PATH=/home/lowell/.local -DBB_PGO="$pgo" \
+    -DBB_LTO="${BB_LTO:-OFF}" -DBB_PGO_DIR="$PWD/pgo" >/dev/null
 echo "GPU library: PGO $pgo, LTO ${BB_LTO:-ON}"
 # A failed GPU build must stop here: an older libbbgpu.so would otherwise be used silently.
 if ! ninja -C out/gpu bbgpu > out/gpu-build.log 2>&1; then
@@ -101,8 +101,22 @@ if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/l
     for source in "${atrac9[@]}"; do "$CC" -std=c99 -O2 -g -w -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"; done
     ar rcs out/libatrac9.a out/atrac9/*.o
 fi
+if [[ -d gpu/third_party/dlss/include && -f gpu/third_party/dlss/lib/libnvsdk_ngx.a ]]; then
+    cmake -S gpu/dlss_bridge -B out/dlss-bridge -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DDLSS_SDK_ROOT="$PWD/gpu/third_party/dlss" -DVULKAN_INCLUDE=/usr/include >/dev/null 2>&1 || true
+    if ninja -C out/dlss-bridge >/dev/null 2>&1; then
+        cp -f out/dlss-bridge/libbbport_dlss.so gpu/third_party/dlss/lib/libnvidia-ngx*.so out/ 2>/dev/null || true
+        cp -f out/dlss-bridge/libbbport_dlss.so gpu/third_party/dlss/lib/libnvidia-ngx*.so out/gpu/ 2>/dev/null || true
+        mkdir -p bin bin/gpu
+        cp -f out/dlss-bridge/libbbport_dlss.so gpu/third_party/dlss/lib/libnvidia-ngx*.so bin/ 2>/dev/null || true
+        cp -f out/dlss-bridge/libbbport_dlss.so gpu/third_party/dlss/lib/libnvidia-ngx*.so bin/gpu/ 2>/dev/null || true
+    fi
+fi
 "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/bb-probe
 echo "Built $PWD/out/bb-probe"
+mkdir -p bin bin/gpu
+cp -f out/bb-probe bin/bb-probe 2>/dev/null || true
+cp -f out/gpu/libbbgpu.so bin/gpu/libbbgpu.so 2>/dev/null || true
 # GPU check for run.sh (live_resolution=auto) and the launcher's gamepad list (--gamepads).
 "$CC" -std=c11 -O2 -Wall -Wextra -Werror "${includes[@]}" tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities
 if [[ ${1:-} == --test ]]; then
