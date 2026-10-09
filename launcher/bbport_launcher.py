@@ -90,6 +90,20 @@ FSR411_BUILD_ERRORS = {
 UI_LANGUAGES = [("Как в системе", ""), ("English", "en"), ("Türkçe", "tr"), ("Русский", "ru"), ("Português (Brasil)", "pt_BR")]
 UPSCALERS = [("NVIDIA DLSS", "dlss"), ("FSR 4", "fsr4"), ("FSR 4.1.1", "fsr411"), ("FSR 3", "fsr3"),
              ("TAA (нативное сглаживание)", "taa"), ("Выключен", "off")]
+FRAME_GENERATION = [
+    ("Выключена", "off"),
+    ("DLSS Frame Generation ×2", "dlss"),
+    ("FSR 3.1.6 Frame Generation ×2", "fsr"),
+]
+DLSS_PRESETS = [
+    ("Авто", "auto"),
+    ("K (Transformer)", "K"),
+    ("L (Transformer v2)", "L"),
+    ("M (Transformer v2)", "M"),
+    ("J (Transformer)", "J"),
+    ("E (CNN)", "E"),
+    ("F (CNN)", "F"),
+]
 PRESETS = [("Native AA", 0), ("Quality (x1.5)", 1), ("Balanced (x1.7)", 2),
            ("Performance (x2)", 3), ("Ultra Performance (x3)", 4)]
 OUTPUT_RES = [("1280×720 (Steam Deck)", "1280x720"), ("1920×1080", "1920x1080"), ("2560×1440", "2560x1440"), ("3840×2160", "3840x2160")]
@@ -160,6 +174,8 @@ DEFAULTS = {
 INI_DEFAULTS = {
     "upscaler": "fsr4",
     "preset": "4",
+    "frame_generation": "off",
+    "dlss_preset": "Auto",
     "sharpen": "1",
     "sharpness": "0.50",
     "object_motion": "1",
@@ -867,6 +883,18 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.preset_row.connect("notify::selected", lambda *_: self.update_upscaler_status())
         self.output_row.connect("notify::selected", lambda *_: self.update_upscaler_status())
         upscaler.add(self.preset_row)
+        self.frame_gen_row = combo_row(
+            tr("Генерация кадров"),
+            tr("DLSS FG (RTX 40+) или FSR 3.1 FG ×2; удваивает FPS отображения"),
+            FRAME_GENERATION,
+            self.ini.get("frame_generation", "off"))
+        upscaler.add(self.frame_gen_row)
+        self.dlss_preset_row = combo_row(
+            tr("Пресет модели DLSS"),
+            tr("Выбор нейросетевой модели DLSS (Transformer / CNN)"),
+            DLSS_PRESETS,
+            self.ini.get("dlss_preset", "auto"))
+        upscaler.add(self.dlss_preset_row)
         self.sharpen_row = Adw.SwitchRow(title=tr("Резкость (RCAS)"),
                                          active=self.ini.get("sharpen") == "1")
         upscaler.add(self.sharpen_row)
@@ -1680,6 +1708,8 @@ class LauncherWindow(Adw.ApplicationWindow):
         save_settings(s)
         self.ini.update({
             "upscaler": combo_value(self.upscaler_row),
+            "frame_generation": combo_value(self.frame_gen_row),
+            "dlss_preset": combo_value(self.dlss_preset_row),
             "preset": str(combo_value(self.preset_row)),
             "sharpen": "1" if self.sharpen_row.get_active() else "0",
             "sharpness": f"{self.sharpness_row.get_value():.2f}",
