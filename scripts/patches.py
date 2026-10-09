@@ -190,9 +190,12 @@ def compile_patches(xml, names, app_version, segments):
         if meta.get('Name') in names and meta.get('AppVer')==app_version and meta.get('AppElf','eboot.bin')=='eboot.bin':
             found[meta.get('Name')]=meta
     missing=[n for n in names if n not in found]
-    if missing: raise ValueError(f'patches not found for app version {app_version}: {missing}')
+    if missing:
+        print(f'Patches: WARNING: patches not found for app version {app_version}: {missing}', file=sys.stderr)
     writes=[]
     for name in names:
+        if name not in found:
+            continue
         for line in found[name].iter('Line'):
             offset=int(line.get('Address'),0)-EBOOT_BASE
             data=encode(line)
@@ -206,13 +209,23 @@ def compile_patches(xml, names, app_version, segments):
 BLOODBORNE_IDS={'CUSA00207','CUSA00208','CUSA00900','CUSA01363','CUSA03173','CUSA03023'}
 
 
-def external_patches(directory, app_version='01.09', exclude=Path(__file__).resolve().parent.parent/'patches/Bloodborne.xml'):
+BUILTIN_PATCH_NAMES = set()
+for fps_list in FPS_PRESETS.values():
+    BUILTIN_PATCH_NAMES.update(fps_list)
+for off, on in EFFECTS.values():
+    if off: BUILTIN_PATCH_NAMES.add(off)
+    if on: BUILTIN_PATCH_NAMES.add(on)
+BUILTIN_PATCH_NAMES.update(MODEL_LOD.values())
+BUILTIN_PATCH_NAMES.add(INTEL_TONEMAP)
+
+
+def external_patches(directory, app_version='01.09', exclude=None):
     """[(key, file, metadata)] of eboot patches for this version in directory/*.xml.
     key is "<file name>/<patch name>" (the launcher's selection, patches.json)."""
     found=[]
     directory=Path(directory)
+    builtin_xml = Path(__file__).resolve().parent.parent / 'patches/Bloodborne.xml'
     for path in sorted(directory.glob('*.xml')) if directory.is_dir() else []:
-        if path.resolve()==Path(exclude).resolve(): continue  # the built-in file (patches/ in a checkout)
         try:
             root=ET.parse(path).getroot()
         except ET.ParseError as error:
@@ -220,9 +233,13 @@ def external_patches(directory, app_version='01.09', exclude=Path(__file__).reso
             continue
         ids={e.text.strip() for e in root.iter('ID') if e.text}
         if ids and not ids&BLOODBORNE_IDS: continue
+        is_builtin = (path.name == 'Bloodborne.xml' or (builtin_xml.is_file() and path.resolve() == builtin_xml.resolve()))
         for meta in root.iter('Metadata'):
             if meta.get('AppVer')==app_version and meta.get('AppElf','eboot.bin')=='eboot.bin':
-                found.append((f'{path.name}/{meta.get("Name")}',path,meta))
+                name = meta.get('Name')
+                if is_builtin and name in BUILTIN_PATCH_NAMES:
+                    continue
+                found.append((f'{path.name}/{name}',path,meta))
     return found
 
 
@@ -233,8 +250,15 @@ def external_selection(found, config):
     if config and Path(config).is_file():
         settings=json.loads(Path(config).read_text())
     enabled,disabled=set(settings.get('enabled',[])),set(settings.get('disabled',[]))
-    return [(key,path,meta) for key,path,meta in found
-            if key in enabled or (key not in disabled and meta.get('isEnabled','false').lower()=='true')]
+    res = []
+    for key, path, meta in found:
+        if key in enabled:
+            res.append((key, path, meta))
+        elif key not in disabled and meta.get('isEnabled','false').lower()=='true':
+            if path.name == 'Bloodborne.xml':
+                continue
+            res.append((key, path, meta))
+    return res
 
 
 def compile_external(selected, segments):
