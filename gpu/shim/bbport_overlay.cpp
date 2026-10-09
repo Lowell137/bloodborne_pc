@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -12,12 +13,24 @@
 
 #include <SDL3/SDL.h>
 #include "bbport_settings.h"
+#include "bbport_mouse.h"
+#include "../bbgpu.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
+#ifdef _WIN32
+asm(".section .rdata,\"dr\"\n"
+    ".balign 16\n"
+    ".global bb_font_ttf\n"
+    "bb_font_ttf:\n"
+    ".incbin \"" BB_FONT_PATH "\"\n"
+    ".global bb_font_ttf_end\n"
+    "bb_font_ttf_end:\n"
+    ".text\n");
+#else
 asm(".section .rodata\n"
     ".balign 16\n"
     ".hidden bb_font_ttf\n"
@@ -28,6 +41,7 @@ asm(".section .rodata\n"
     ".global bb_font_ttf_end\n"
     "bb_font_ttf_end:\n"
     ".previous\n");
+#endif
 extern "C" const unsigned char bb_font_ttf[];
 extern "C" const unsigned char bb_font_ttf_end[];
 
@@ -42,17 +56,21 @@ bool initialized = false;
 std::atomic<bool> menu_open{false};
 bool l3_down = false, r3_down = false;
 bool dirty = false; // settings changed while open: saved on close
+// The game's text dialog (SetTextEntry), guarded by imgui_mutex.
+bool text_entry_active = false;
+std::string text_entry_prompt, text_entry_text;
 float base_scale = 1.0f;
-
-// The game's text dialog (ImeDialog, the character name), typed on the keyboard: drawn while it
-// is open. In fullscreen the window title that showed it is not visible (issues #17, #19).
-std::mutex prompt_mutex;
-std::atomic<bool> prompt_active{false};
-std::string prompt_title, prompt_text;
 
 // Present rate for the FPS counter.
 std::chrono::steady_clock::time_point last_present{};
 float frame_ms_avg = 0.0f;
+std::atomic<std::int64_t> mouse_toast_until{0};
+bool mouse_toast_enabled = false;
+
+std::int64_t NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 float PixelDensity(SDL_WindowID id);
 
@@ -60,6 +78,12 @@ void SetOpen(bool value) {
     if (menu_open.exchange(value) == value) {
         return;
     }
+    // Releases may arrive while the menu is closed. Drop old presses/queued events so
+    // reopening the menu never inherits a held mouse button, modifier or gamepad key.
+    ImGuiIO& io = ImGui::GetIO();
+    io.ClearEventsQueue();
+    io.ClearInputKeys();
+    io.ClearInputMouse();
     // The system cursor shows over the menu (window.cpp); ImGui learns where it is now, not at
     // the next motion: mouse motion is not passed on while the menu is closed.
     if (value) {
@@ -77,6 +101,12 @@ void SetOpen(bool value) {
 }
 
 ImGuiKey KeyFromSdl(SDL_Keycode key) {
+    if (key >= SDLK_A && key <= SDLK_Z) {
+        return ImGuiKey(ImGuiKey_A + key - SDLK_A);
+    }
+    if (key >= SDLK_0 && key <= SDLK_9) {
+        return ImGuiKey(ImGuiKey_0 + key - SDLK_0);
+    }
     switch (key) {
     case SDLK_TAB: return ImGuiKey_Tab;
     case SDLK_LEFT: return ImGuiKey_LeftArrow;
@@ -138,12 +168,16 @@ void Store(std::atomic<T>& target, T value, bool changed) {
 
 void Checkbox(const char* label, std::atomic<bool>& value) {
     bool v = value;
-    Store(value, v, ImGui::Checkbox(label, &v));
+    // Evaluate the widget first: argument evaluation order could otherwise read v
+    // before ImGui edits it, storing the old value again (Clang on Windows does).
+    const bool changed = ImGui::Checkbox(label, &v);
+    Store(value, v, changed);
 }
 
 void Slider(const char* label, std::atomic<float>& value, float lo, float hi) {
     float v = value;
-    Store(value, v, ImGui::SliderFloat(label, &v, lo, hi, "%.2f"));
+    const bool changed = ImGui::SliderFloat(label, &v, lo, hi, "%.2f");
+    Store(value, v, changed);
 }
 
 void Hint(const char* text) {
@@ -160,17 +194,26 @@ void Hint(const char* text) {
 void Menu() {
     auto& s = BbSettings::Get();
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float pad = 12.0f * base_scale;
+    const ImVec2 limit(std::max(viewport->WorkSize.x - 2 * pad, 1.0f),
+                       std::max(viewport->WorkSize.y - 2 * pad, 1.0f));
+    const ImVec2 size(std::min(620.0f * base_scale, limit.x),
+                      std::min(820.0f * base_scale, limit.y));
     // Where it was moved last (bbport.ini menu_pos, a fraction of the screen), kept on screen.
     ImVec2 pos(viewport->WorkPos.x + 40.0f * base_scale, viewport->WorkPos.y + 40.0f * base_scale);
     if (s.menu_x >= 0.0f && s.menu_y >= 0.0f) {
-        const float margin = 80.0f * base_scale;
-        pos.x = viewport->WorkPos.x +
-                std::clamp(s.menu_x * viewport->WorkSize.x, 0.0f, std::max(viewport->WorkSize.x - margin, 0.0f));
-        pos.y = viewport->WorkPos.y +
-                std::clamp(s.menu_y * viewport->WorkSize.y, 0.0f, std::max(viewport->WorkSize.y - margin, 0.0f));
+        pos.x = viewport->WorkPos.x + s.menu_x * viewport->WorkSize.x;
+        pos.y = viewport->WorkPos.y + s.menu_y * viewport->WorkSize.y;
     }
+    pos.x = std::clamp(pos.x, viewport->WorkPos.x + pad,
+                       viewport->WorkPos.x + pad + limit.x - size.x);
+    pos.y = std::clamp(pos.y, viewport->WorkPos.y + pad,
+                       viewport->WorkPos.y + pad + limit.y - size.y);
     ImGui::SetNextWindowPos(pos, ImGuiCond_Appearing);
-    ImGui::SetNextWindowSize(ImVec2(620.0f * base_scale, 0.0f), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(size, ImGuiCond_Appearing);
+    ImGui::SetNextWindowSizeConstraints(
+        ImVec2(std::min(360.0f * base_scale, limit.x), std::min(240.0f * base_scale, limit.y)),
+        limit);
     bool keep_open = true;
     if (!ImGui::Begin(
             BbSettings::MenuText("Bloodborne - Graphics  (Insert / L3+R3)###bbport_settings",
@@ -179,6 +222,15 @@ void Menu() {
         ImGui::End();
         return;
     }
+    ImGui::TextDisabled("bbport %s", bbgpu_version());
+    // Resizing the game window or dragging the menu must leave every control reachable.
+    const ImVec2 at = ImGui::GetWindowPos(), actual_size = ImGui::GetWindowSize();
+    const ImVec2 bounded(
+        std::clamp(at.x, viewport->WorkPos.x + pad,
+                   viewport->WorkPos.x + pad + std::max(limit.x - actual_size.x, 0.0f)),
+        std::clamp(at.y, viewport->WorkPos.y + pad,
+                   viewport->WorkPos.y + pad + std::max(limit.y - actual_size.y, 0.0f)));
+    ImGui::SetWindowPos(bounded);
     // Moved: remembered (saved with the settings when the menu closes).
     if (!ImGui::IsWindowAppearing() && viewport->WorkSize.x > 0.0f && viewport->WorkSize.y > 0.0f) {
         const ImVec2 at = ImGui::GetWindowPos();
@@ -200,18 +252,21 @@ void Menu() {
     }
     ImGui::Text(BbSettings::MenuText("%.0f FPS  (%.1f ms)", "%.0f FPS  (%.1f мс)"),
                 frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f, frame_ms_avg);
+    if (s.frame_generation_active && s.frame_generation_render_ms > 0)
+        ImGui::Text(BbSettings::MenuText("FG 2x | Render: %.0f FPS", "FG 2x | Рендер: %.0f FPS"),
+                    1000.f / s.frame_generation_render_ms.load());
 
     ImGui::SeparatorText(BbSettings::MenuText("Temporal upscaler", "Временной апскейлер"));
     const char* upscalers[] = {
         BbSettings::MenuText("Off", "Выкл"), "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1 (INT8)",
-        BbSettings::MenuText("TAA (native anti-aliasing)", "TAA (нативное сглаживание)")};
-    static const char* later[] = {"DLSS", "XeSS"};
+        BbSettings::MenuText("TAA (native anti-aliasing)", "TAA (родное сглаживание)"), "DLSS (NVIDIA RTX)"};
+    static const char* later[] = {"XeSS"};
     int upscaler = s.upscaler;
     if (ImGui::BeginCombo(BbSettings::MenuText("Upscaler", "Апскейлер"), upscalers[upscaler])) {
         for (int i = 0; i < BbSettings::UpscalerCount; ++i) {
-            const bool supported = i == BbSettings::UpscalerFsr4     ? s.fsr4_supported.load()
-                                   : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load()
-                                                                     : true;
+            const bool supported = i == BbSettings::UpscalerFsr4 ? s.fsr4_supported.load()
+                : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load()
+                : i == BbSettings::UpscalerDlss   ? s.dlss_supported.load() : true;
             ImGui::BeginDisabled(!supported);
             if (ImGui::Selectable(upscalers[i], i == upscaler)) {
                 Store(s.upscaler, i, true);
@@ -231,6 +286,9 @@ void Menu() {
             ImGui::TextDisabled("%s", BbSettings::MenuText("— in development", "— в работе"));
         }
         ImGui::EndCombo();
+    }
+    if (const char* problem = s.dlss_problem.load(); problem && upscaler == BbSettings::UpscalerDlss) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "DLSS: %s", problem);
     }
     if (const char* problem = s.fsr4_problem.load()) {
         ImGui::PushTextWrapPos();
@@ -274,7 +332,47 @@ void Menu() {
             "Проверка при гостинге: сеть FSR 4 нормирует цвет по экспозиции и по ней решает, "
             "когда отбросить прошлые кадры. Меняются сразу, без перезапуска."));
     }
+    if (s.upscaler == BbSettings::UpscalerDlss) {
+        const int selected = s.dlss_preset;
+        if (ImGui::BeginCombo(BbSettings::MenuText("DLSS model preset", "Пресет модели DLSS"),
+                              BbSettings::DlssPresetLabel(selected))) {
+            for (int preset : BbSettings::DlssPresets) {
+                if (ImGui::Selectable(BbSettings::DlssPresetLabel(preset), preset == selected))
+                    Store(s.dlss_preset, preset, true);
+            }
+            ImGui::EndCombo();
+        }
+        Hint(BbSettings::MenuText(
+            "E/F: CNN. J/K: Transformer. M/L: Transformer 2. The DLL selects the model from "
+            "the preset. A-D were removed from current SDKs and may be substituted by the DLL; "
+            "E/F are deprecated. Changes apply immediately with a history reset.",
+            "E/F: свёрточная. J/K: трансформер. M/L: трансформер 2. DLL выбирает модель по "
+            "пресету. A-D удалены из актуальных SDK и могут заменяться самой DLL; E/F устарели. "
+            "Изменения применяются сразу со сбросом истории."));
+    }
     const bool upscaler_on = s.upscaler != BbSettings::UpscalerOff;
+    static const char *fg_names[] = {"Off", "FSR 3.1.6 x2", "DLSS Frame Generation x2"};
+    int fg = s.frame_generation;
+    if (ImGui::BeginCombo(BbSettings::MenuText("Frame generation", "Генерация кадров"),
+                          fg_names[fg])) {
+        for (int i = 0; i < BbSettings::FrameGenerationCount; ++i) {
+            const bool available = i == 0 || (upscaler_on && (i == BbSettings::FrameGenerationFsr
+                                                                  ? s.fsr_fg_supported.load()
+                                                                  : s.dlss_fg_supported.load()));
+            ImGui::BeginDisabled(!available);
+            if (ImGui::Selectable(fg_names[i], i == fg))
+                Store(s.frame_generation, i, true);
+            ImGui::EndDisabled();
+        }
+        ImGui::EndCombo();
+    }
+    if (const auto *problem = s.frame_generation_problem.load())
+        ImGui::TextWrapped("%s", problem);
+    if (s.frame_generation != BbSettings::FrameGenerationOff)
+        Hint(BbSettings::MenuText("SDR gameplay only. Frame generation adds display frames; "
+                                  "simulation/input rate stays unchanged.",
+                                  "Только игра в SDR. Добавляет кадры вывода; частота симуляции и "
+                                  "ввода остаётся прежней."));
     const bool taa = s.upscaler == BbSettings::UpscalerTaa;
     ImGui::BeginDisabled(!upscaler_on);
     ImGui::BeginDisabled(taa);
@@ -346,7 +444,10 @@ void Menu() {
     Checkbox(BbSettings::MenuText("Sharpening (RCAS)", "Резкость (RCAS)"), s.sharpen);
     ImGui::BeginDisabled(!s.sharpen);
     Slider(BbSettings::MenuText("Sharpness", "Сила резкости"), s.sharpness, 0.0f, 2.0f);
-    Hint(BbSettings::MenuText(
+    Hint(s.upscaler == BbSettings::UpscalerDlss ? BbSettings::MenuText(
+        "RCAS sharpening is applied after DLSS. Ctrl+click the slider to enter an exact value.",
+        "Резкость RCAS применяется после DLSS. Ctrl+клик по ползунку — ввести точное значение.")
+        : BbSettings::MenuText(
         "Up to 1: the upscaler's own sharpening (RCAS). Above 1 adds another RCAS pass. "
         "Ctrl+click the slider to enter an exact value.",
         "До 1 — резкость самого апскейлера (RCAS). Выше 1 добавляется ещё один проход RCAS. "
@@ -360,7 +461,13 @@ void Menu() {
         "кадров больше деталей. Без него получается только сглаживание по истории."));
 
     ImGui::SeparatorText(BbSettings::MenuText("Reactive mask", "Маска реактивности"));
-    ImGui::BeginDisabled(taa);
+    const bool dlss = s.upscaler == BbSettings::UpscalerDlss;
+    if (dlss) {
+        ImGui::TextWrapped("%s", BbSettings::MenuText(
+            "DLSS does not use this reactive mask. These controls apply to FSR.",
+            "DLSS не использует эту маску реактивности. Эти настройки применяются к FSR."));
+    }
+    ImGui::BeginDisabled(taa || dlss);
     Checkbox(BbSettings::MenuText("Enable mask", "Включить маску"), s.reactive);
     Hint(BbSettings::IsFsr4(s.upscaler)
              ? BbSettings::MenuText(
@@ -519,6 +626,20 @@ void Menu() {
     }
 
     ImGui::SeparatorText(BbSettings::MenuText("Other", "Прочее"));
+    ImGui::BeginDisabled(!BbMouse::Available());
+    Checkbox(BbSettings::MenuText("Mouse camera (F4)", "Камера мышью (F4)"), s.mouse_camera);
+    Slider(BbSettings::MenuText("Mouse sensitivity (%)", "Чувствительность мыши (%)"),
+           s.mouse_sensitivity, 1.f, 400.f);
+    Checkbox(BbSettings::MenuText("Invert mouse Y", "Инверсия мыши по Y"), s.mouse_invert_y);
+    ImGui::EndDisabled();
+    if (const auto* reason = BbMouse::Problem()) ImGui::TextWrapped("%s", reason);
+    Hint(BbSettings::MenuText(
+        "Raw mouse motion controls the camera directly, without stick acceleration. "
+        "F4 toggles capture. Opening this menu or switching windows releases the cursor. "
+        "Sensitivity is independent of the frame cap. Lock-on keeps the game's camera.",
+        "Мышь управляет камерой напрямую, без ускорения стика. F4 переключает захват. "
+        "Меню и переключение окон освобождают курсор. Чувствительность не зависит от "
+        "ограничителя FPS. При захвате цели работает камера игры."));
     Checkbox(BbSettings::MenuText("FPS counter in corner", "Счётчик FPS в углу"), s.show_fps);
 
     ImGui::Spacing();
@@ -532,6 +653,30 @@ void Menu() {
     if (!keep_open) {
         SetOpen(false);
     }
+}
+
+// The game's text dialog: what is typed, and how to finish (keyboard or controller).
+void TextEntryBox() {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+                                   viewport->WorkPos.y + viewport->WorkSize.y * 0.42f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(viewport->WorkSize.x * 0.32f, 0.0f),
+                                        ImVec2(viewport->WorkSize.x * 0.8f, FLT_MAX));
+    ImGui::SetNextWindowBgAlpha(0.92f);
+    ImGui::Begin("##text_entry", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::TextColored(ImVec4(0.85f, 0.72f, 0.45f, 1.0f), "%s", text_entry_prompt.c_str());
+    ImGui::Separator();
+    ImGui::SetWindowFontScale(1.4f);
+    ImGui::Text("%s_", text_entry_text.c_str());
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::Separator();
+    ImGui::TextDisabled("Keyboard: type, Backspace to erase, Enter = OK, Esc = cancel");
+    ImGui::TextDisabled("Controller: Cross (A) = OK, Circle (B) = cancel");
+    ImGui::End();
 }
 
 void FpsCounter() {
@@ -551,45 +696,46 @@ void FpsCounter() {
                 s.upscaler == BbSettings::UpscalerFsr3     ? "FSR 3.1"
                 : s.upscaler == BbSettings::UpscalerFsr4   ? "FSR 4"
                 : s.upscaler == BbSettings::UpscalerFsr411 ? "FSR 4.1.1"
-                : s.upscaler == BbSettings::UpscalerTaa    ? "TAA"
-                                                           : "");
+                : s.upscaler == BbSettings::UpscalerTaa ? "TAA"
+                : s.upscaler == BbSettings::UpscalerDlss ? "DLSS"
+                                                         : "");
+    if (s.frame_generation_active && s.frame_generation_render_ms > 0)
+        ImGui::Text(BbSettings::MenuText("FG 2x | Render: %.0f FPS", "FG 2x | Рендер: %.0f FPS"),
+                    1000.f / s.frame_generation_render_ms.load());
     ImGui::End();
 }
 
-void TextPrompt() {
-    std::string title, text;
-    {
-        std::scoped_lock lock{prompt_mutex};
-        title = prompt_title;
-        text = prompt_text;
-    }
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
-                                   viewport->WorkPos.y + viewport->WorkSize.y * 0.5f),
-                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowBgAlpha(0.9f);
-    ImGui::Begin("##textprompt", nullptr,
-                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
-                     ImGuiWindowFlags_NoFocusOnAppearing);
-    ImGui::TextUnformatted(title.c_str());
-    ImGui::Separator();
-    ImGui::Text("%s_", text.c_str());
-    ImGui::Separator();
-    ImGui::TextUnformatted("Keyboard: type, Backspace = delete, Enter = OK, Esc = cancel");
+void MouseCameraToast() {
+    const auto* viewport = ImGui::GetMainViewport();
+    const float margin = std::min(24.f * base_scale, viewport->WorkSize.x * .05f);
+    const float width = std::max(1.f, std::min(560.f * base_scale,
+                                             viewport->WorkSize.x - 2.f * margin));
+    const char* text = BbMouse::Problem();
+    if (!text) text = mouse_toast_enabled
+        ? BbSettings::MenuText("Mouse camera enabled (F4)", "Камера мышью включена (F4)")
+        : BbSettings::MenuText("Mouse camera disabled (F4)", "Камера мышью выключена (F4)");
+    const auto padding = ImGui::GetStyle().WindowPadding;
+    const float text_height = ImGui::CalcTextSize(text, nullptr, false,
+        std::max(1.f, width - 2.f * padding.x)).y;
+    const float height = std::max(1.f, std::min(text_height + 2.f * padding.y,
+                                              viewport->WorkSize.y - 2.f * margin));
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * .5f,
+                                  viewport->WorkPos.y + viewport->WorkSize.y - margin),
+                            ImGuiCond_Always, ImVec2(.5f, 1.f));
+    // Wrapped text needs a width on its very first frame. Auto-fitting both axes
+    // makes ImGui wrap to the minimum width and grow into a vertical column.
+    ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(.85f);
+    ImGui::Begin("##mouse_camera_toast", nullptr,
+                 ImGuiWindowFlags_NoDecoration |
+                 ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                 ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
+    ImGui::TextWrapped("%s", text);
     ImGui::End();
 }
 
 } // namespace
 
-void SetTextPrompt(bool active, const std::string& prompt, const std::string& text) {
-    {
-        std::scoped_lock lock{prompt_mutex};
-        prompt_title = prompt;
-        prompt_text = text;
-    }
-    prompt_active = active;
-}
 
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) {
     std::scoped_lock lock{imgui_mutex};
@@ -677,8 +823,9 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
-        if (down && !event.key.repeat &&
-            (event.key.key == SDLK_INSERT || (is_open && event.key.key == SDLK_ESCAPE))) {
+        const bool close_on_escape = is_open && event.key.key == SDLK_ESCAPE &&
+            !io.WantTextInput && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup);
+        if (down && !event.key.repeat && (event.key.key == SDLK_INSERT || close_on_escape)) {
             SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);
             return true;
         }
@@ -741,6 +888,8 @@ bool HandleEvent(const SDL_Event& event) {
                            : event.button.button == SDL_BUTTON_MIDDLE ? 2
                                                                       : -1;
         if (button >= 0) {
+            const float density = PixelDensity(event.button.windowID);
+            io.AddMousePosEvent(event.button.x * density, event.button.y * density);
             io.AddMouseButtonEvent(button, event.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
         }
         return true;
@@ -749,24 +898,45 @@ bool HandleEvent(const SDL_Event& event) {
         if (!is_open) {
             return false;
         }
-        io.AddMouseWheelEvent(event.wheel.x, event.wheel.y);
+        io.AddMouseWheelEvent(event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event.wheel.x
+                                                                            : event.wheel.x,
+                             event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event.wheel.y
+                                                                            : event.wheel.y);
         return true;
+    case SDL_EVENT_WINDOW_FOCUS_GAINED:
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        io.AddFocusEvent(event.type == SDL_EVENT_WINDOW_FOCUS_GAINED);
+        if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+            l3_down = r3_down = false;
+        }
+        return false; // window lifecycle events still belong to the window
     default:
         return false;
     }
 }
 
 bool Visible() {
-    return initialized && (menu_open || prompt_active || BbSettings::Get().show_fps);
+    return initialized && (menu_open || text_entry_active || BbSettings::Get().show_fps ||
+                           mouse_toast_until.load(std::memory_order_relaxed) > NowMs());
 }
 
-bool MenuOpen() {
-    return menu_open;
-}
+bool MenuOpen() { return menu_open; }
 
 bool CapturesInput() {
-    // The text dialog too: keys typed into it (Backspace is the touchpad) stay out of the game.
-    return menu_open || prompt_active;
+    return menu_open || text_entry_active;
+}
+
+void SetTextEntry(bool active, const std::string& prompt, const std::string& text) {
+    std::scoped_lock lock{imgui_mutex};
+    text_entry_active = active;
+    text_entry_prompt = prompt;
+    text_entry_text = text;
+}
+
+void ShowMouseCamera(bool enabled) {
+    std::scoped_lock lock{imgui_mutex};
+    mouse_toast_enabled = enabled;
+    mouse_toast_until = NowMs() + 2500;
 }
 
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
@@ -801,8 +971,11 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if (BbSettings::Get().show_fps && !menu_open) {
         FpsCounter();
     }
-    if (prompt_active && !menu_open) {
-        TextPrompt();
+    if (text_entry_active) {
+        TextEntryBox();
+    }
+    if (mouse_toast_until.load(std::memory_order_relaxed) > NowMs()) {
+        MouseCameraToast();
     }
     ImGui::Render();
 

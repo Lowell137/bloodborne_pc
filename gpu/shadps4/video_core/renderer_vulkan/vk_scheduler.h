@@ -717,6 +717,8 @@ public:
             Wait(tick - 1);
         }
     }
+    // Compatibility for the Windows DLSS bridge's resource retirement.
+    void WaitSubmitted() { WaitSubmittedWork(); }
 
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);

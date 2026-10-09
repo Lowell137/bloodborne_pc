@@ -7,7 +7,12 @@
 #include <chrono>
 #include <cstdio>
 #include <time.h>
+#ifndef _WIN32
 #include <sys/resource.h>
+#else
+#include <windows.h>
+#include <psapi.h>
+#endif
 #include <cstring>
 #include <dirent.h>
 #include <unistd.h>
@@ -303,6 +308,7 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 /// DRM clients, RSS) and the parts we know of. GTT holds the game's direct memory (fixed).
 static void PrintMemory() {
     u64 vram_kib = 0, gtt_kib = 0;
+#ifndef _WIN32
     std::vector<u64> clients;
     if (DIR* dir = opendir("/proc/self/fdinfo")) {
         while (const dirent* entry = readdir(dir)) {
@@ -339,6 +345,12 @@ static void PrintMemory() {
         std::fclose(statm);
     }
     const u64 rss = u64(rss_pages) * u64(sysconf(_SC_PAGESIZE));
+#else
+    PROCESS_MEMORY_COUNTERS counters{};
+    counters.cb = sizeof(counters);
+    K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters));
+    const u64 rss = counters.WorkingSetSize;
+#endif
     const u64 device = BbStats::device_alloc_bytes.load() - BbStats::device_free_bytes.load();
     u64 vma_blocks = 0, vma_used = 0;
     Vulkan::VmaDeviceUsage(vma_blocks, vma_used);
@@ -411,9 +423,11 @@ void VideoOutDriver::Flip(const Request& req) {
         last_twf = twf;
         const u64 copy_ns = BbStats::t_copy.load(), copy_bytes = BbStats::copy_bytes.load();
         u64 proc_flt = 0;
+#ifndef _WIN32
         if (rusage usage{}; getrusage(RUSAGE_SELF, &usage) == 0) {
             proc_flt = usage.ru_minflt;
         }
+#endif
         const u64 t_now[6] = {BbStats::t_resident.load(), BbStats::t_protect.load(),
                               BbStats::t_image_create.load(), BbStats::t_refresh.load(),
                               BbStats::t_staging.load(), BbStats::t_host_wait.load()};

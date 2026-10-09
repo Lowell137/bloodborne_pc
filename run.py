@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Windows counterpart of run.sh: prepares the game image and starts bb-probe.exe.
+
+Same environment variables as run.sh (BB_GAME_DIR, BB_DATA_DIR, BB_FPS, BB_RENDER_RES,
+BB_LIVE_RES, BB_PATCHES, BB_MODS_*, BB_USER_DIR, ...). Extra arguments go to bb-probe.
+The in-game "Apply and restart" runs this script again through BB_RESTART_COMMAND;
+`--after PID` waits for the previous game process to end first (its GPU device and memory).
+"""
+import ctypes
+from ctypes import wintypes
+from datetime import datetime
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+
+PORT = Path(__file__).resolve().parent
+
+
+def fail(message):
+    print(message, file=sys.stderr)
+    sys.exit(1)
+
+
+def wait_for(pid):
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    SYNCHRONIZE = 0x00100000
+    handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+    if handle:
+        try:
+            if kernel32.WaitForSingleObject(handle, 30000) != 0:
+                fail(f'Previous game process {pid} has not exited; restart cancelled.')
+        finally:
+            kernel32.CloseHandle(handle)
+
+
+def no_console():
+    """Started without a console (the launcher): console programs must not open their own."""
+    return 0 if ctypes.windll.kernel32.GetConsoleWindow() else subprocess.CREATE_NO_WINDOW
+
+
+def run_script(name, *args, capture=False):
+    # Inside the packaged Bloodborne.exe (PyInstaller) the executable runs scripts itself.
+    script = ['--script'] if getattr(sys, 'frozen', False) else []
+    command = [sys.executable, *script, str(PORT / 'scripts' / name), *map(str, args)]
+    if capture:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True,
+                                creationflags=no_console())
+        if result.returncode:
+            sys.exit(result.returncode)
+        return result.stdout
+    # stdin given: the output handles are passed explicitly (a windowed Bloodborne.exe child would
+    # get none otherwise).
+    result = subprocess.run(command, stdin=subprocess.DEVNULL, creationflags=no_console())
+    if result.returncode:
+        sys.exit(result.returncode)
+    return None
+
+
+def ini_value(path, key):
+    try:
+        for line in Path(path).read_text(encoding='utf-8', errors='replace').splitlines():
+            match = re.fullmatch(rf'{re.escape(key)}=(.*)', line.strip())
+            if match:
+                return match.group(1)
+    except OSError:
+        pass
+    return None
+
+
+def find_executable(name):
+    """bin/ (packaged), else out/ (built with build.sh)."""
+    for candidate in (PORT / 'bin' / name, PORT / 'out' / name):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def configure_runtime(env, fps, data):
+    """Shared renderer defaults from upstream 0.4, with the Windows memory backend."""
+    env.setdefault('BB_PREUPLOAD', '1')
+    env.setdefault('BB_COPY_GPU_BUFFERS', '1')
+    env.setdefault('BB_GPU_WRITE_TWINS', '1')
+    env.setdefault('BB_GPU_WRITE_TWINS_MAX', '65536')
+    # dma-buf and userfaultfd do not exist on Windows; never enable partial substitutes.
+    env['BB_PC_MODEL'] = '0'
+    env['BB_GUEST_IN_PLACE'] = '0'
+    env['BB_GUEST_GPU_MEMORY'] = '0'
+    env['BB_UFFD'] = '0'
+    if env.get('BB_AS_0_3') == '1':
+        env.update(BB_HOST_COPY_WAITS='all', BB_PRODUCER_CHECK='1')
+    env.setdefault('BB_VBLANK_HZ', {'uncap': '480', '90': '90'}.get(fps, '60'))
+    if env.get('BB_SAVE_LOG') == '1':
+        logs = Path(data) / 'logs'
+        logs.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        env['BB_FRAME_STATS'] = '1'
+        env.setdefault('BB_FRAME_LOG', str(logs / f'{stamp}.frames.csv'))
+        env.setdefault('BB_READBACK_LOG', str(logs / f'{stamp}.readbacks.csv'))
+        return logs / f'{stamp}.log'
+    return None
+
+
+def launch_probe(command, log_path=None):
+    if log_path is None:
+        return subprocess.run(command, stdin=subprocess.DEVNULL, creationflags=no_console()).returncode
+    print(f'Log: {log_path}')
+    with Path(log_path).open('w', encoding='utf-8') as log:
+        with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace',
+                              creationflags=no_console()) as process:
+            for line in process.stdout:
+                log.write(line)
+                log.flush()
+                print(line, end='', flush=True)
+            return process.wait()
+
+
+def main():
+    args = sys.argv[1:]
+    if len(args) >= 2 and args[0] == '--after':
+        wait_for(int(args[1]))
+        args = args[2:]
+    # As run.sh: relative paths (BB_GAME_DIR, BB_DATA_DIR, fsr4_shaders/) are from the port.
+    os.chdir(PORT)
+    env = os.environ
+    data = Path(env.get('BB_DATA_DIR', PORT))
+    out = data / 'out'
+    out.mkdir(parents=True, exist_ok=True)
+    # Keep native driver crash dumps with this portable installation's logs.
+    crash_dir = Path(env.setdefault('BB_CRASH_DIR', str(data / 'logs' / 'crashes')))
+    try:
+        crash_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        print(f'Crash dumps unavailable: {error}')
+        env['BB_CRASH_DUMP'] = '0'
+    env.setdefault('BB_CONFIG', str(data / 'bbport.ini'))
+    config = env['BB_CONFIG']
+    if not env.get('BB_FSR411_DIR') and not (PORT / 'fsr4_411').is_dir() and (data / 'fsr4_411').is_dir():
+        env['BB_FSR411_DIR'] = str(data / 'fsr4_411')
+
+    probe = Path(env['BB_PROBE']) if env.get('BB_PROBE') else find_executable('bb-probe.exe')
+    if not probe or not probe.is_file():
+        fail('bb-probe.exe not found: build it with build.sh (MSYS2 CLANG64) or use a packaged build.')
+    # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).
+    if not (probe.parent / 'SDL3.dll').is_file():
+        roots = [Path(env['MSYS2_ROOT'])] if env.get('MSYS2_ROOT') else [Path(r'C:\msys64'), PORT / 'out/msys64']
+        for root in roots:
+            clang64 = root / 'clang64/bin'
+            if clang64.is_dir():
+                env['PATH'] = f'{clang64}{os.pathsep}{env.get("PATH", "")}'
+                break
+
+    game = Path(env.get('BB_GAME_DIR', PORT.parent / 'CUSA03173'))
+    if not (game / 'eboot.bin').is_file():
+        fail(f'No eboot.bin in {game} (set BB_GAME_DIR).')
+    original_game = game.resolve()
+    game = Path(run_script('mods.py', game, '--out', out,
+                           '--mods-dir', env.get('BB_MODS_DIR', data / 'mods'),
+                           '--config', env.get('BB_MODS_CONFIG', data / 'mods.json'),
+                           '--enabled', env.get('BB_MODS_ENABLED', '1'), capture=True).strip())
+    mod_view = game if game.resolve() != original_game else None
+    try:
+        run_script('prepare.py', game, '--out', out)
+        run_script('link_libc.py', game, '--out', out)
+        run_script('link_modules.py', game, '--out', out)
+        run_script('content_profile.py', game, '--out', out, '--sku', env.get('BB_CONTENT_SKU', 'full'))
+
+        # Patches exist for game version 01.09 only (patches.py applies none to others): other
+        # versions keep the game's 30 FPS timing and change resolutions live.
+        sys.path.insert(0, str(PORT / 'scripts'))
+        from patches import game_app_version
+        version = game_app_version(game)
+        patched = version in (None, '01.09') or bool(env.get('BB_FORCE_PATCHES'))
+        if not patched:
+            print(f'Game version {version}: community patches need 01.09; 30 FPS, no effect patches')
+        # Sizes chosen below for the previous launch are recomputed after an in-game restart.
+        if env.get('BB_AUTO_RENDER_RES') == '1':
+            for key in ('BB_RENDER_RES', 'BB_OUTPUT_RES', 'BB_AUTO_RENDER_RES'):
+                env.pop(key, None)
+        fps = env.get('BB_FPS', 'uncap') if patched else '30'
+        scaled_render = scaled_output = None
+        if not env.get('BB_RENDER_RES'):
+            printed = run_script('patches.py', '--print-scaled', '--settings', config, capture=True).split()
+            if len(printed) == 2:
+                scaled_render, scaled_output = printed
+        live = '0'
+        if scaled_output:
+            live = env.get('BB_LIVE_RES') or ini_value(config, 'live_resolution') or '0'
+            if live == 'auto':
+                caps = probe.parent / 'bb-gpu-capabilities.exe'
+                result = subprocess.run([str(caps), '--live-resolution'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                        text=True, creationflags=no_console())
+                live = result.stdout.strip() if result.returncode == 0 else '0'
+            live = '1' if live == '1' or not patched else '0'
+        if live == '1':
+            print(f'Output {scaled_output}: live resolution changes (live_resolution=0: startup patch)')
+        elif scaled_output:
+            env.update(BB_RENDER_RES=scaled_render, BB_OUTPUT_RES=scaled_output, BB_AUTO_RENDER_RES='1')
+            env.setdefault('BB_DMEM_MB', '9152')
+            print(f'Output {scaled_output}: scene {scaled_render}, direct memory {env["BB_DMEM_MB"]} MiB '
+                  '(live_resolution=1: live changes)')
+        run_script('patches.py', '--out', out, '--fps', fps, '--extra', env.get('BB_PATCHES', ''),
+                   '--settings', config, '--game-dir', game, '--render-res', env.get('BB_RENDER_RES', ''),
+                   '--output-res', env.get('BB_OUTPUT_RES', ''),
+                   '--patches-dir', env.get('BB_PATCHES_DIR', data / 'patches'),
+                   '--patches-config', env.get('BB_PATCHES_CONFIG', data / 'patches.json'))
+        log_path = configure_runtime(env, fps, data)
+
+        # The in-game restart starts this script again once this process is gone.
+        # GPU caches (shaders, pipelines) beside the saves; read before main(), so set here.
+        user_dir = Path(env.get('BB_USER_DIR', data / 'user')).resolve()
+        user_dir.mkdir(parents=True, exist_ok=True)
+        env.setdefault('BB_GPU_USER_DIR', str(user_dir))
+        this = ['--run'] if getattr(sys, 'frozen', False) else [str(Path(__file__).resolve())]
+        restart = [sys.executable, *this, '--after', str(os.getpid()), *args]
+        env['BB_RESTART_COMMAND'] = subprocess.list2cmdline(restart)
+        command = [str(probe), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),
+                   '--patches', str(out / 'patches.bin'), '--app0', str(game),
+                   '--user', str(user_dir),
+                   '--timeout', env.get('BB_TIMEOUT', '0'), *args]
+        # No stdin: an inherited pipe (shells such as Git Bash) cost the game its console output.
+        return launch_probe(command, log_path)
+    finally:
+        if mod_view:
+            shutil.rmtree(mod_view, ignore_errors=True)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

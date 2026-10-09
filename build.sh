@@ -2,6 +2,50 @@
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
 mkdir -p out
+# Windows: MSYS2 CLANG64 (packages in packaging/windows/README.md). The GPU library is static
+# there and CMake links bb-probe.exe as well; no PGO (GCC-only flags), LTO off by default.
+case $(uname -s) in
+MINGW*|MSYS*)
+    # shellcheck source=msys2-env.sh
+    source ./msys2-env.sh
+    for tool in clang cmake ninja pkg-config; do
+        command -v "$tool" >/dev/null || { echo "Need $tool from MSYS2 CLANG64 (packaging/windows/README.md)." >&2; exit 1; }
+    done
+    if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ||
+          ! -f gpu/third_party/xbyak/xbyak/xbyak.h ]]; then
+        git submodule update --init --recursive
+    fi
+    for patch in gpu/patches/fsr-vulkan/*.patch; do
+        if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
+            git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
+        fi
+    done
+    cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO=off \
+        -DBB_LTO="${BB_LTO:-OFF}" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ >/dev/null
+    echo "GPU library and loader: LTO ${BB_LTO:-OFF}"
+    if ! ninja -C out/gpu bb-probe bb-gpu-capabilities bb-play > out/gpu-build.log 2>&1; then
+        grep -v '^\[' out/gpu-build.log | tail -40 >&2
+        echo 'Build failed (full log: out/gpu-build.log)' >&2; exit 1
+    fi
+    cp out/gpu/bb-probe.exe out/gpu/bb-gpu-capabilities.exe out/gpu/bb-play.exe out/
+    echo "Built $PWD/out/bb-probe.exe"
+    if [[ ${1:-} == --test ]]; then
+        # Exercise the optional bridge in the renderer tests when it was built.
+        if [[ -f out/bbport_dlss.dll && -f out/nvngx_dlss.dll ]]; then
+            cp out/bbport_dlss.dll out/nvngx_dlss.dll out/gpu/
+            if [[ -f out/nvngx_dlssg.dll ]]; then cp out/nvngx_dlssg.dll out/gpu/; fi
+        else
+            rm -f out/gpu/bbport_dlss.dll out/gpu/nvngx_dlss.dll out/gpu/nvngx_dlssg.dll
+        fi
+        ninja -C out/gpu bb-tests > out/test-build.log 2>&1 || {
+            tail -50 out/test-build.log >&2; exit 1;
+        }
+        ctest --test-dir out/gpu --output-on-failure
+        python -m unittest discover -s tests -p 'test_*.py'
+    fi
+    exit 0
+    ;;
+esac
 if [[ -z ${CC:-} ]]; then
     CC=$(command -v cc || command -v gcc || true)
     if [[ -z $CC ]]; then

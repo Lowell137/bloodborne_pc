@@ -8,8 +8,12 @@
 #include <unordered_map>
 #include <cstring>
 #include <string>
+#ifndef _WIN32
 #include <dlfcn.h>
 #include <execinfo.h>
+#else
+#include <windows.h>
+#endif
 #include <unistd.h>
 #include <functional>
 
@@ -62,8 +66,13 @@ void ReportProducer(const char* what, u32 other, const char* other_where, const 
                  what, self, ThreadName(self).c_str(), where, other, ThreadName(other).c_str(),
                  other_where ? other_where : "?");
     void* frames[24];
+#ifdef _WIN32
+    const auto depth = CaptureStackBackTrace(0, 24, frames, nullptr);
+    for (unsigned i = 0; i < depth; ++i) std::fprintf(stderr, "  %p\n", frames[i]);
+#else
     const int depth = backtrace(frames, 24);
     backtrace_symbols_fd(frames, depth, 2);
+#endif
 }
 } // namespace
 
@@ -282,8 +291,12 @@ void Scheduler::TraceDirectRecording(void* caller) {
     }
     std::ranges::sort(top, std::greater{});
     for (size_t i = 0; i < std::min<size_t>(top.size(), 8); ++i) {
+#ifdef _WIN32
+        struct { const char* dli_fname; void* dli_fbase; } info{nullptr, nullptr};
+#else
         Dl_info info{};
         dladdr(top[i].second, &info);
+#endif
         std::printf("Recorder sync caller: %llu x %s+0x%lx\n",
                     static_cast<unsigned long long>(top[i].first),
                     info.dli_fname ? info.dli_fname : "?",

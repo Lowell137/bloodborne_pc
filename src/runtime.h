@@ -3,13 +3,19 @@
 #include <time.h>
 #include <stdint.h>
 #include <stddef.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#include "compat_win.h"
+/* No signals on Windows: the exception handler resumes the thread in bb_longjmp
+ * (gpu/shim/bbport_toggles.h uses the same buffer type). */
+typedef bb_jmp_buf sigjmp_buf;
+#define sigsetjmp(buffer, save) bb_setjmp(buffer)
+#else
 #include <setjmp.h>
+#endif
 /* Recovery point for speculative guest memory reads on this thread (probe.c fault handler). */
 extern __thread sigjmp_buf *runtime_fault_recover;
 /* Restarts the game (in-game settings menu, render resolution change). */
 void runtime_restart(void);
-#endif
 #define ABI __attribute__((sysv_abi))
 typedef void (ABI *GuestCallback)(void);
 void runtime_start(uint64_t capabilities);
@@ -21,6 +27,13 @@ void runtime_mutex_report(void);
 uintptr_t runtime_memory_resolve(const char *name);
 void runtime_memory_report(void);
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
+/* Host copies bypass guest-page protection while retaining shared backing and small-store
+ * fence semantics. Unmapped reads are zero-filled; unmapped writes fail. */
+int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size);
+void runtime_memory_read_backing(uintptr_t address, void *data, uint64_t size);
+int runtime_memory_direct_phys(uintptr_t address, uint64_t *phys, uintptr_t *end);
+int runtime_memory_vma_info(uintptr_t address, int *prot, int *type, uintptr_t *end);
+void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write);
 /* The CPU is about to write the range outside guest code (a file read): tells the GPU side. */
 void runtime_memory_note_write(uintptr_t address, uint64_t size);
 void runtime_memory_note_cpu_write(uintptr_t address, uint64_t size);
@@ -75,6 +88,8 @@ void runtime_thread_keys_cleanup(void);
 /* Guest-visible errno values are FreeBSD's. */
 int32_t runtime_guest_errno(int host_errno);
 void *runtime_low_map(size_t size, int prot);
+/* Windows: reserves the PS4 user address range as a placeholder (no-op elsewhere). */
+void runtime_memory_reserve(void);
 uintptr_t runtime_ajm_resolve(const char *name);
 void runtime_ajm_report(void);
 uintptr_t runtime_audio_resolve(const char *name);

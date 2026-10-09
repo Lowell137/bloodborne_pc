@@ -10,6 +10,7 @@
 // BB_RENDER_RES retains the older startup-patched guest-resolution path.
 
 #pragma once
+#include "video_core/renderer_vulkan/vk_frame_generation.h"
 
 #include <array>
 #include <chrono>
@@ -20,6 +21,7 @@
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_fsr4.h"
 #include "video_core/texture_cache/image.h"
 
@@ -123,6 +125,7 @@ public:
         vk::Image image;
         vk::Format format;
         u32 width, height;
+        std::shared_ptr<FrameGenerationInput> generation;
     };
     bool DisplayOverride(VAddr address, Display& display);
     /// BB_PRESENT_DUMP_TRIGGER: whether this presented frame is to be saved (consumes the trigger).
@@ -148,6 +151,8 @@ private:
 
     void Run();
     void RunScaled();
+    void CaptureGeneration(vk::Image depth, vk::Format depth_format, u32 w, u32 h, float frame_ms,
+                           bool reset);
     void RunUiOnly(VideoCore::ImageId color, VideoCore::ImageId depth);
     void EnsureUiResources(u32 width, u32 height, vk::Format color, vk::Format depth);
     void PrepareUiDepth(VideoCore::ImageId depth);
@@ -173,6 +178,12 @@ private:
     bool RecordReactive(vk::ImageView color_view);
     /// FSR 4 is selected, possible in this session (not BB_RENDER_RES) and has not failed.
     [[nodiscard]] bool UseFsr4() const;
+    /// bbport: DLSS selected and the bridge is ready (NVIDIA RTX, bbport_dlss.dll).
+    [[nodiscard]] bool UseDlss() const;
+    /// Records DLSS into `cmdbuf` (output in General). `hdr`: linear scene color input.
+    bool RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource& color,
+                    const Dlss::Resource& depth, u32 w, u32 h, u32 ow, u32 oh, float frame_ms,
+                    bool hdr);
     /// Records FSR 4 into output_image; on a permanent failure FSR 3 takes over.
     bool RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color, Fsr4Upscaler::Image depth,
                     u32 w, u32 h, u32 ow, u32 oh, float frame_ms);
@@ -189,6 +200,10 @@ private:
     SceneTargets& scene_targets;
     int applied_preset = -1;
     int applied_upscaler = -1;
+    int applied_dlss_preset = -1;
+    int applied_frame_generation = -1;
+    std::vector<std::shared_ptr<FrameGenerationInput>> generation_pool;
+    std::shared_ptr<FrameGenerationInput> generation_input, display_generation_input;
     bool dispatched_last_frame = false;
     bool last_active = false, last_jitter = false;
 
@@ -246,6 +261,7 @@ private:
         vk::Format format{};
         u32 width = 0, height = 0;
         bool valid = false;
+        std::shared_ptr<FrameGenerationInput> generation;
     };
     std::mutex display_mutex;
     int present_dump_remaining = 0, present_dump_index = 0;
@@ -256,6 +272,7 @@ private:
     bool resources_taa = false;
     std::unique_ptr<Fsr4Upscaler> fsr4;
     bool fsr4_failed = false;
+    bool dlss_failed = false;
     VideoCore::UniqueImage motion_image;
     VideoCore::UniqueImage output_image;
     vk::UniqueImageView motion_view;

@@ -1,7 +1,7 @@
 // This file is part of the FidelityFX SDK.
 //
 // Copyright (C) 2026 Advanced Micro Devices, Inc.
-// 
+//
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files(the "Software"), to deal
 // in the Software without restriction, including without limitation the rights
@@ -201,9 +201,9 @@ typedef ffxReturnCode_t (*PfnFfxDispatch)(ffxContext* context, const ffxDispatch
 #define FFX_PRAGMA_WARNING_DISABLE_DEPRECATIONS GCC diagnostic ignored "-Wdeprecated"
 #define FFX_PRAGMA_WARNING_WARN_DEPRECATIONS GCC diagnostic warning "-Wdeprecated"
 #else
-#define FFX_PRAGMA_WARNING_PUSH 
-#define FFX_PRAGMA_WARNING_POP 
-#define FFX_PRAGMA_WARNING_DISABLE_DEPRECATIONS 
+#define FFX_PRAGMA_WARNING_PUSH
+#define FFX_PRAGMA_WARNING_POP
+#define FFX_PRAGMA_WARNING_DISABLE_DEPRECATIONS
 #endif
 
 #define FFX_DEPRECATION(message) [[deprecated(message)]]

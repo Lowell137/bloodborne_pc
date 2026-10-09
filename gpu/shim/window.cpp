@@ -6,10 +6,19 @@
 #include "common/logging/log.h"
 #include "sdl_window.h"
 #include "bbport_overlay.h"
+#include "bbport_mouse.h"
+#include "bbport_settings.h"
+#include "../../src/host_input.h"
 
 namespace Frontend {
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
+    // Windows SDL relative mode uses native Raw Input. Keep its device counts
+    // unscaled even if inherited SDL environment hints enable pointer acceleration.
+    SDL_SetHintWithPriority(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE, "0", SDL_HINT_OVERRIDE);
+    SDL_SetHintWithPriority(SDL_HINT_MOUSE_RELATIVE_SPEED_SCALE, "1", SDL_HINT_OVERRIDE);
+    SDL_SetHintWithPriority(SDL_HINT_MOUSE_RELATIVE_WARP_MOTION, "0", SDL_HINT_OVERRIDE);
+    SDL_SetHintWithPriority(SDL_HINT_MOUSE_EMULATE_WARP_WITH_RELATIVE, "0", SDL_HINT_OVERRIDE);
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         UNREACHABLE_MSG("Failed to initialize SDL video: {}", SDL_GetError());
@@ -22,6 +31,9 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height_);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_VULKAN_BOOLEAN, true);
+    // Native startup smoke tests create a real Win32 surface without showing a window.
+    const char* hidden = std::getenv("BB_HIDDEN_WINDOW");
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_HIDDEN_BOOLEAN, hidden && hidden[0] == '1');
     const char* fullscreen = std::getenv("BB_FULLSCREEN");
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, fullscreen && fullscreen[0] == '1');
     base_title = title;
@@ -31,6 +43,12 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
 
     const char* driver = SDL_GetCurrentVideoDriver();
     const SDL_PropertiesID wp = SDL_GetWindowProperties(window);
+#ifdef _WIN32
+    if (driver && !std::strcmp(driver, "windows")) {
+        window_info.type = WindowSystemType::Windows;
+        window_info.render_surface = SDL_GetPointerProperty(wp, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+    } else
+#endif
     if (driver && !std::strcmp(driver, "x11")) {
         window_info.type = WindowSystemType::X11;
         window_info.display_connection = SDL_GetPointerProperty(wp, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr);
@@ -50,6 +68,8 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
 }
 
 WindowSDL::~WindowSDL() {
+    BbMouse::SetActive(false);
+    SDL_SetWindowRelativeMouseMode(window, false);
     SDL_DestroyWindow(window);
 }
 
@@ -71,10 +91,11 @@ void WindowSDL::UpdateTextTitle() {
     const std::string title = text_active ? base_title + " \u2014 " + text_prompt + ": " + text + "_  (Enter = OK, Esc = cancel)"
                                           : base_title;
     SDL_SetWindowTitle(window, title.c_str());
-    BbOverlay::SetTextPrompt(text_active, text_prompt, text);
+    BbOverlay::SetTextEntry(text_active, text_prompt, text);
 }
 
 bool WindowSDL::PollEvents() {
+    UpdateMouseCapture();
     {
         std::scoped_lock lock{text_mutex};
         if (text_requested) { // SDL text input must be toggled from the window thread
@@ -87,6 +108,7 @@ bool WindowSDL::PollEvents() {
     if (!text_active) {
         BbOverlay::UpdateTextInput(window);
     }
+    UpdateMouseCapture(); // a requested game text dialog releases capture before draining input
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         if (event.type == SDL_EVENT_MOUSE_MOTION) {
@@ -108,8 +130,45 @@ bool WindowSDL::PollEvents() {
             UpdateTextTitle();
             continue;
         }
-        if (BbOverlay::HandleEvent(event)) {
+        // The controller finishes the text dialog too: Cross (A) accepts, Circle (B) cancels.
+        if (text_active && event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
+            (event.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH ||
+             event.gbutton.button == SDL_GAMEPAD_BUTTON_EAST)) {
+            std::scoped_lock lock{text_mutex};
+            text_state = event.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH ? 1 : 2;
+            text_active = false;
+            SDL_StopTextInput(window);
+            UpdateTextTitle();
             continue;
+        }
+        if (BbOverlay::HandleEvent(event)) {
+            UpdateMouseCapture();
+            continue;
+        }
+        if (!text_active && event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F4 &&
+            !event.key.repeat && !(event.key.mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_GUI))) {
+            if (BbMouse::Available()) {
+                auto& settings = BbSettings::Get();
+                settings.mouse_camera = !settings.mouse_camera;
+                UpdateMouseCapture();
+                BbSettings::Save();
+            }
+            BbOverlay::ShowMouseCamera(BbSettings::Get().mouse_camera);
+        }
+        if (event.type == SDL_EVENT_MOUSE_MOTION && event.motion.windowID == SDL_GetWindowID(window) &&
+            event.motion.which != SDL_TOUCH_MOUSEID && event.motion.which != SDL_PEN_MOUSEID &&
+            mouse_captured && !text_active &&
+            !BbOverlay::CapturesInput()) {
+            BbMouse::Motion(event.motion.xrel, event.motion.yrel);
+        }
+        if (event.type == SDL_EVENT_MOUSE_WHEEL && !text_active && !BbOverlay::CapturesInput()) {
+            const float sign = event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1.f : 1.f;
+            const float x = event.wheel.x * sign, y = event.wheel.y * sign;
+            const auto until = SDL_GetTicks() + 80; // one short press, visible to guest pad sampling
+            if (y > 0) wheel_until[0] = until;
+            if (y < 0) wheel_until[1] = until;
+            if (x < 0) wheel_until[2] = until;
+            if (x > 0) wheel_until[3] = until;
         }
         switch (event.type) {
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
@@ -128,16 +187,44 @@ bool WindowSDL::PollEvents() {
             break;
         }
     }
+    UpdateMouseCapture();
+    UpdateMouseButtons();
     UpdateCursor();
     return is_open;
+}
+
+void WindowSDL::UpdateMouseButtons() {
+    u32 buttons = 0;
+    if (!text_active && !BbOverlay::CapturesInput() &&
+        (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS)) {
+        // SDL mouse APIs belong to the window thread; guest threads read only this snapshot.
+        buttons = SDL_GetMouseState(nullptr, nullptr);
+        const auto now = SDL_GetTicks();
+        for (unsigned i = 0; i < 4; ++i) if (now < wheel_until[i]) buttons |= BB_WHEEL_UP << i;
+    } else {
+        for (auto& until : wheel_until) until = 0;
+    }
+    mouse_buttons.store(buttons, std::memory_order_relaxed);
+}
+
+void WindowSDL::UpdateMouseCapture() {
+    const bool desired = BbMouse::Available() && BbSettings::Get().mouse_camera && !text_active &&
+                         !BbOverlay::CapturesInput() &&
+                         (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS);
+    if (desired != mouse_captured) {
+        BbMouse::SetActive(false); // flush stale deltas before SDL changes capture
+        if (SDL_SetWindowRelativeMouseMode(window, desired)) mouse_captured = desired;
+        else LOG_ERROR(Frontend, "Cannot change raw mouse capture: {}", SDL_GetError());
+    }
+    BbMouse::SetActive(desired && mouse_captured);
 }
 
 // Issue #3: the OS cursor over the game. Hidden in fullscreen, and in a window after 3 s without
 // moving the mouse; always shown while the settings menu is open.
 void WindowSDL::UpdateCursor() {
     const bool fullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
-    const bool hide = !BbOverlay::MenuOpen() &&
-                      (fullscreen || SDL_GetTicks() - last_mouse_motion_ms > 3000);
+    const bool hide = mouse_captured || (!BbOverlay::CapturesInput() &&
+                      (fullscreen || SDL_GetTicks() - last_mouse_motion_ms > 3000));
     if (hide != cursor_hidden) {
         cursor_hidden = hide;
         hide ? SDL_HideCursor() : SDL_ShowCursor();

@@ -1,10 +1,15 @@
 #define _GNU_SOURCE
 #include <assert.h>
 #include <unistd.h>
+#include "test_platform.h"
 #include "../src/runtime_pad.c"
 
 static int capture;
+static Uint32 mouse_buttons;
+static uint8_t camera_x, camera_y;
 int bbgpu_overlay_captures_input(void) { return capture; }
+uint32_t bbgpu_mouse_buttons(void) { return mouse_buttons; }
+void bbgpu_camera_stick(uint8_t x, uint8_t y) { camera_x=x; camera_y=y; }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
     return 0;
@@ -19,14 +24,14 @@ static void inject(const char *path, const char *tokens) {
 }
 
 int main(void) {
-    char path[]="/tmp/bbport-pad-test-XXXXXX";
-    int fd=mkstemp(path);
+    char path[4096];
+    int fd=bb_test_temp(path,sizeof(path),"bbport-pad-test");
     assert(fd>=0);
     close(fd);
     setenv("BB_PAD_FILE",path,1);
     /* bbport.ini controls: buttons moved, a trigger as a button and a button as a trigger. */
-    char config[]="/tmp/bbport-pad-config-XXXXXX";
-    int config_fd=mkstemp(config);
+    char config[4096];
+    int config_fd=bb_test_temp(config,sizeof(config),"bbport-pad-config");
     assert(config_fd>=0);
     const char controls[]="upscaler=fsr3\npad.cross=b\npad.circle=a\npad.r2=rightshoulder\n"
                           "pad.r1=righttrigger\nkey.cross=X, Space\npad.bogus=a\n";
@@ -73,17 +78,35 @@ int main(void) {
     SDL_UpdateGamepads();
     assert(pad_read_state(1,&data)==0);
     assert(gamepad && data.touch_count==2 && (data.buttons & BTN_TOUCHPAD));
+    // The final native axes also drive mouse/controller ownership, including
+    // vertical-only movement and neutralization while the port menu is open.
+    assert(SDL_SetJoystickVirtualAxis(joystick,SDL_GAMEPAD_AXIS_RIGHTY,-32768));
+    SDL_UpdateJoysticks(); SDL_UpdateGamepads();
+    assert(pad_read_state(1,&data)==0 && data.right_y==0);
+    assert(camera_x==data.right_x && camera_y==0);
+    assert(SDL_SetJoystickVirtualAxis(joystick,SDL_GAMEPAD_AXIS_RIGHTX,32767));
+    SDL_UpdateJoysticks(); SDL_UpdateGamepads();
+    assert(pad_read_state(1,&data)==0 && camera_x==255 && camera_y==0);
+    assert(SDL_SetJoystickVirtualAxis(joystick,SDL_GAMEPAD_AXIS_RIGHTX,0));
+    assert(SDL_SetJoystickVirtualAxis(joystick,SDL_GAMEPAD_AXIS_RIGHTY,0));
+    SDL_UpdateJoysticks(); SDL_UpdateGamepads();
+    assert(pad_read_state(1,&data)==0 && camera_x==128 && camera_y==128);
     assert(data.touches[0].x==1439 && data.touches[0].y==471 && data.touches[0].id==2);
     assert(data.touches[1].x==480 && data.touches[1].y==942 && data.touches[1].id==3);
     capture=1;
     assert(pad_read_state(1,&data)==0 && data.touch_count==0 && data.buttons==0);
+    assert(camera_x==128 && camera_y==128);
     capture=0;
     assert(SDL_SetJoystickVirtualTouchpad(joystick,0,0,false,0,0,0));
     assert(SDL_SetJoystickVirtualTouchpad(joystick,0,1,false,0,0,0));
     SDL_UpdateJoysticks();
     SDL_UpdateGamepads();
-    assert(pad_read_state(1,&data)==0 && data.touch_count==1 && data.touches[0].x==480);
+    // A touchpad/button still held when the menu closes must not become a new gesture.
+    assert(pad_read_state(1,&data)==0 && data.touch_count==0 && data.buttons==0);
     assert(SDL_SetJoystickVirtualButton(joystick,SDL_GAMEPAD_BUTTON_TOUCHPAD,false));
+    SDL_UpdateJoysticks();
+    SDL_UpdateGamepads();
+    assert(pad_read_state(1,&data)==0 && data.buttons==0 && data.touch_count==0);
     assert(SDL_SetJoystickVirtualButton(joystick,SDL_GAMEPAD_BUTTON_EAST,true));
     assert(SDL_SetJoystickVirtualButton(joystick,SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,true));
     assert(SDL_SetJoystickVirtualAxis(joystick,SDL_GAMEPAD_AXIS_RIGHT_TRIGGER,32767));
@@ -93,6 +116,38 @@ int main(void) {
     assert(data.buttons==(BTN_CROSS|BTN_R2|BTN_R1) && data.r2==255);
     assert(bindings[IN_CROSS].key_count==2 && bindings[IN_CROSS].keys[0]==SDL_SCANCODE_X &&
            bindings[IN_CROSS].keys[1]==SDL_SCANCODE_SPACE);
+    /* Capture-helper names round-trip through the actual INI parser and pad ABI. */
+    FILE *mouse_config=fopen(config,"w");
+    assert(mouse_config);
+    fputs("key.cross=Space, Mouse Left\nkey.r1=Mouse X1\nkey.r2=Mouse Right\n"
+          "key.square=Mouse Middle\nkey.circle=Mouse X2\nkey.up=Mouse Wheel Up\n"
+          "key.down=Mouse Wheel Down\nkey.left=Mouse Wheel Left\nkey.right=Mouse Wheel Right\n"
+          "key.triangle=Comma\nkey.move_up=Mouse Left\n",mouse_config);
+    fclose(mouse_config);
+    load_bindings();
+    assert(bindings[IN_CROSS].key_count==1 && bindings[IN_CROSS].mouse_count==1);
+    bool keyboard[SDL_SCANCODE_COUNT]={0};
+    PadData mapped={.left_x=128,.left_y=128,.right_x=128,.right_y=128};
+    apply_keyboard(&mapped,keyboard,SDL_BUTTON_LMASK|SDL_BUTTON_MMASK|SDL_BUTTON_RMASK|
+                   SDL_BUTTON_X1MASK|SDL_BUTTON_X2MASK|BB_WHEEL_UP|BB_WHEEL_RIGHT);
+    assert(mapped.buttons==(BTN_CROSS|BTN_SQUARE|BTN_CIRCLE|BTN_R1|BTN_R2|BTN_UP|BTN_RIGHT));
+    assert(mapped.r2==255 && mapped.left_y==0);
+    keyboard[SDL_SCANCODE_COMMA]=true;
+    mapped=(PadData){0};
+    apply_keyboard(&mapped,keyboard,0);
+    assert(mapped.buttons==BTN_TRIANGLE);
+    keyboard[SDL_SCANCODE_COMMA]=false;
+    mapped=(PadData){0};
+    apply_keyboard(&mapped,keyboard,BB_WHEEL_DOWN|BB_WHEEL_LEFT);
+    assert(mapped.buttons==(BTN_DOWN|BTN_LEFT));
+    mapped=(PadData){0};
+    apply_keyboard(&mapped,keyboard,0);
+    assert(mapped.buttons==0);
+    mouse_buttons=SDL_BUTTON_RMASK;
+    capture=1;
+    assert(pad_read_state(1,&data)==0 && data.buttons==0 && data.r2==0);
+    capture=0;
+    mouse_buttons=0;
     SDL_CloseJoystick(joystick);
     if (gamepad) SDL_CloseGamepad(gamepad);
     gamepad=NULL;

@@ -1,7 +1,7 @@
 // This file is part of the FidelityFX SDK.
 //
 // Copyright (C) 2026 Advanced Micro Devices, Inc.
-// 
+//
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files(the "Software"), to deal
 // in the Software without restriction, including without limitation the rights
@@ -68,7 +68,7 @@ enum FfxApiSurfaceFormat
     FFX_API_SURFACE_FORMAT_R8G8_TYPELESS,               ///<  8 bit per channel, 2 channel typeless format
     FFX_API_SURFACE_FORMAT_R32_TYPELESS,                ///< 32 bit per channel, 1 channel typeless format
     FFX_API_SURFACE_FORMAT_R32G32_UINT,                 ///< 32 bit per channel, 2 channel uint format
-    
+
     FFX_API_SURFACE_FORMAT_R8_SNORM,                    ///<  8 bit per channel, 1 channel signed normalized format
 };
 
@@ -240,7 +240,7 @@ typedef struct FfxApiFloat4
 
 /// A 4x4 matrix in row-major layout with row-vector convention.
 /// This is the canonical format expected by FFX APIs.
-/// 
+///
 /// Memory layout: rows[row_index][column_index]
 /// Mathematical convention: v * M (row vector multiplied by matrix)
 typedef struct FfxApiMatrix4x4

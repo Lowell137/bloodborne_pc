@@ -5,24 +5,30 @@
 #include "runtime.h"
 #include <stdatomic.h>
 #include <stdio.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
 #include <time.h>
 #include <unistd.h>
+#ifndef _WIN32
 #include <sys/syscall.h>
 #include <dlfcn.h>
 #include <dirent.h>
 #include <ucontext.h>
 #include <signal.h>
 #include <sys/uio.h>
-#include <sys/random.h>
-#include <sys/resource.h>
+#else
+#include <windows.h>
+#endif
 #include <sys/time.h>
 #include <x86intrin.h>
+#ifndef _WIN32
+#include <sys/random.h>
+#include <sys/resource.h>
+#endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define PAGE 16384
 
@@ -97,7 +103,11 @@ static ABI uint64_t tsc_frequency(void) {
     if (!tsc_hz) {
         struct timespec a,b,nap={0,20000000};
         clock_gettime(CLOCK_MONOTONIC,&a); uint64_t t0=__rdtsc();
+#ifdef _WIN32
+        (void)nap; compat_sleep_ns(20000000);
+#else
         nanosleep(&nap,NULL);
+#endif
         clock_gettime(CLOCK_MONOTONIC,&b); uint64_t t1=__rdtsc();
         uint64_t ns=(uint64_t)(b.tv_sec-a.tv_sec)*1000000000+(uint64_t)(b.tv_nsec-a.tv_nsec);
         tsc_hz=(t1-t0)*1000000000/(ns ? ns : 1);
@@ -114,14 +124,20 @@ void runtime_sleep_stats(uint64_t *calls, uint64_t *ns) {
     *calls=atomic_exchange(&sleep_calls,0); *ns=atomic_exchange(&sleep_total_ns,0);
 }
 static int sleep_ns(uint64_t ns) {
-    struct timespec t={.tv_sec=(time_t)(ns/1000000000),.tv_nsec=(long)(ns%1000000000)}, a, b;
+    struct timespec a, b;
     clock_gettime(CLOCK_MONOTONIC,&a);
     int result=0;
+#ifdef _WIN32
+    compat_sleep_ns(ns);
+#else
+    struct timespec t={.tv_sec=(time_t)(ns/1000000000),.tv_nsec=(long)(ns%1000000000)};
     while (nanosleep(&t,&t)) if (errno!=EINTR) { result=errno; break; }
+#endif
     clock_gettime(CLOCK_MONOTONIC,&b);
+    const uint64_t elapsed=(uint64_t)((b.tv_sec-a.tv_sec)*1000000000+(b.tv_nsec-a.tv_nsec));
     atomic_fetch_add(&sleep_calls,1);
-    atomic_fetch_add(&sleep_total_ns,(uint64_t)((b.tv_sec-a.tv_sec)*1000000000+(b.tv_nsec-a.tv_nsec)));
-    runtime_wait_note(3,(uint64_t)((b.tv_sec-a.tv_sec)*1000000000+(b.tv_nsec-a.tv_nsec)));
+    atomic_fetch_add(&sleep_total_ns,elapsed);
+    runtime_wait_note(3,elapsed);
     return result;
 }
 static ABI int32_t kernel_usleep(uint32_t usec) { sleep_ns((uint64_t)usec*1000); return 0; }
@@ -139,8 +155,13 @@ static ABI int32_t kernel_nanosleep(const GuestTimespec *rq,GuestTimespec *rem) 
 typedef struct { int32_t minuteswest, dsttime; } GuestTimezone;
 static ABI int32_t kernel_gettimezone(GuestTimezone *tz) {
     if (!tz) return ERR(22);
-    time_t now=time(NULL); struct tm local; localtime_r(&now,&local);
+    time_t now=time(NULL);
+#ifdef _WIN32
+    tz->minuteswest=(int32_t)(-compat_utc_offset(now)/60); tz->dsttime=0;
+#else
+    struct tm local; localtime_r(&now,&local);
     tz->minuteswest=(int32_t)(-local.tm_gmtoff/60); tz->dsttime=0;
+#endif
     return 0;
 }
 static ABI int32_t posix_gettimeofday(GuestTimeval *tv,GuestTimezone *tz) {
@@ -199,12 +220,19 @@ static ABI int32_t guest_sigfillset(GuestSigset *set) { if (!set) return fail_po
 static ABI int32_t guest_sigemptyset(GuestSigset *set) { if (!set) return fail_posix(EINVAL); memset(set,0,sizeof(*set)); return 0; }
 typedef struct { GuestTimeval utime, stime; int64_t rest[14]; } GuestRusage;
 static ABI int32_t guest_getrusage(int who,GuestRusage *out) {
-    struct rusage r;
     if (!out || (who!=0 && who!=1)) return fail_posix(EINVAL);
-    getrusage(who==0 ? RUSAGE_SELF : RUSAGE_THREAD,&r);
     memset(out,0,sizeof(*out));
+#ifdef _WIN32
+    int64_t user=0,kernel=0;
+    compat_cpu_times(who,&user,&kernel);
+    out->utime=(GuestTimeval){user/1000000,user%1000000};
+    out->stime=(GuestTimeval){kernel/1000000,kernel%1000000};
+#else
+    struct rusage r;
+    getrusage(who==0 ? RUSAGE_SELF : RUSAGE_THREAD,&r);
     out->utime=(GuestTimeval){r.ru_utime.tv_sec,r.ru_utime.tv_usec};
     out->stime=(GuestTimeval){r.ru_stime.tv_sec,r.ru_stime.tv_usec};
+#endif
     return 0;
 }
 static ABI int32_t guest_sysctl(const int32_t *name,uint32_t namelen,void *old,uint64_t *oldlen,const void *new_value,uint64_t newlen) {
@@ -212,7 +240,11 @@ static ABI int32_t guest_sysctl(const int32_t *name,uint32_t namelen,void *old,u
     if (!name || namelen<2 || new_value) return fail_posix(EINVAL);
     if (name[0]==1 && name[1]==37) { /* kern.arandom */
         if (!old || !oldlen) return fail_posix(EINVAL);
+#ifdef _WIN32
+        if (compat_random(old,(size_t)*oldlen)) return fail_posix(EIO);
+#else
         if (getrandom(old,(size_t)*oldlen,0)<0) return fail_posix(errno);
+#endif
         return 0;
     }
     if (name[0]==6 && (name[1]==7 || name[1]==3)) { /* hw.pagesize / hw.ncpu */
@@ -313,12 +345,6 @@ static const RuntimeExport exports[]={
     {"pthread_setspecific",posix_key_set}, {"pthread_getspecific",key_get},
 };
 uintptr_t runtime_kernel_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
-#else
-uintptr_t runtime_kernel_resolve(const char *name) { (void)name; return 0; }
-int32_t runtime_guest_errno(int e) { return e ? 5 : 0; }
-void runtime_thread_keys_cleanup(void) {}
-#endif
-
 static void sample_start(void);
 static void sample_report(void);
 
@@ -334,9 +360,15 @@ static void guest_call_sites(uint64_t out[3]) {
     const uintptr_t text_lo=0x800000000ull, text_hi=0x800000000ull+0x50d96dcull;
     static _Thread_local uintptr_t stack_hi;
     if (!stack_hi) {
+#ifdef _WIN32
+        ULONG_PTR low=0, high=0;
+        GetCurrentThreadStackLimits(&low,&high);
+        stack_hi=(uintptr_t)high;
+#else
         pthread_attr_t attr; void *base=NULL; size_t size=0;
         if (!pthread_getattr_np(pthread_self(),&attr)) { pthread_attr_getstack(&attr,&base,&size); pthread_attr_destroy(&attr); }
         stack_hi=(uintptr_t)base+size;
+#endif
     }
     const uintptr_t *sp=(const uintptr_t *)__builtin_frame_address(0);
     int found=0;
@@ -347,7 +379,13 @@ void runtime_wait_note(int kind, uint64_t ns) {
     static int enabled=-1;
     if (enabled<0) enabled=getenv("BB_FRAME_STATS")!=NULL;
     if (!enabled) return;
-    if (!wait_tid) wait_tid=(int)syscall(SYS_gettid);
+    if (!wait_tid) {
+#ifdef _WIN32
+        wait_tid=(int)GetCurrentThreadId();
+#else
+        wait_tid=(int)syscall(SYS_gettid);
+#endif
+    }
     uint64_t sites[3];
     guest_call_sites(sites);
     const uint64_t key=((sites[0]<<20)^(sites[1]*0x9E3779B1ull)^(sites[2]<<7)^((uint64_t)wait_tid<<4)^(uint64_t)kind)|1;
@@ -355,7 +393,7 @@ void runtime_wait_note(int kind, uint64_t ns) {
         WaitSite *w=&wait_sites[(slot+i)%512];
         uint64_t expected=0;
         if (atomic_load(&w->key)==key || atomic_compare_exchange_strong(&w->key,&expected,key)) {
-            if (!w->tid) { w->site=sites[0]; w->site2=sites[1]; w->site3=sites[2]; w->kind=kind; pthread_getname_np(pthread_self(),w->name,sizeof(w->name)); w->tid=wait_tid; }
+            if (!w->tid) { w->site=sites[0]; w->site2=sites[1]; w->site3=sites[2]; w->kind=kind; snprintf(w->name,sizeof(w->name),"guest"); w->tid=wait_tid; }
             atomic_fetch_add(&w->count,1); atomic_fetch_add(&w->ns,ns);
             return;
         }
@@ -375,16 +413,16 @@ void runtime_wait_report(double frames) {
     if (!dump_checked) { const char *path=getenv("BB_WAIT_LOG"); if (path && *path) dump=fopen(path,"w"); dump_checked=1; }
     if (dump) {
         for (int i=0;i<n;++i)
-            fprintf(dump,"%s %d %s %#lx %#lx %#lx %.2f %.3f\n", rows[i].w->name, rows[i].w->tid, kinds[rows[i].w->kind&3],
-                    (unsigned long)rows[i].w->site, (unsigned long)rows[i].w->site2, (unsigned long)rows[i].w->site3,
+            fprintf(dump,"%s %d %s %#" PRIx64 " %#" PRIx64 " %#" PRIx64 " %.2f %.3f\n", rows[i].w->name, rows[i].w->tid, kinds[rows[i].w->kind&3],
+                    rows[i].w->site, rows[i].w->site2, rows[i].w->site3,
                     rows[i].count/frames, rows[i].ns/(frames*1e6));
         fprintf(dump,"--\n"); fflush(dump);
     }
     for (int i=1;i<n;++i) for (int j=i;j>0 && rows[j].ns>rows[j-1].ns;--j) { __typeof__(rows[0]) t=rows[j]; rows[j]=rows[j-1]; rows[j-1]=t; }
     printf("Guest waits per frame (thread kind +site):");
     for (int i=0;i<n && i<12;++i) if (rows[i].ns/rows[i].count<5000000)
-        printf("%s %s %s +%#lx<+%#lx<+%#lx %.1fx %.2f ms", i ? ";" : "", rows[i].w->name, kinds[rows[i].w->kind&3],
-               (unsigned long)rows[i].w->site, (unsigned long)rows[i].w->site2, (unsigned long)rows[i].w->site3,
+        printf("%s %s %s +%#" PRIx64 "<+%#" PRIx64 "<+%#" PRIx64 " %.1fx %.2f ms", i ? ";" : "", rows[i].w->name, kinds[rows[i].w->kind&3],
+               rows[i].w->site, rows[i].w->site2, rows[i].w->site3,
                rows[i].count/frames, rows[i].ns/(frames*1e6));
     printf("\n");
 }
@@ -392,6 +430,7 @@ void runtime_wait_report(double frames) {
 /* bbport BB_SAMPLE_THREAD=<name> (with frame stats): where that thread runs, sampled with SIGPROF
  * every 0.5 ms; reported with the wait profile. A thread that never blocks but waits for the GPU
  * shows up spinning in its polling loop. */
+#ifndef _WIN32
 static _Atomic uint64_t sample_keys[1024], sample_counts[1024];
 static uint64_t sample_rips[1024], sample_callers[1024];
 static _Atomic uint64_t samples_total;
@@ -493,5 +532,9 @@ static void sample_report(void) {
     }
     printf("\n");
 }
+#else
+static void sample_start(void) {}
+static void sample_report(void) {}
+#endif
 /* The first three return addresses into the game's code on the calling thread's stack. */
 void runtime_guest_call_sites(uint64_t out[3]) { guest_call_sites(out); }

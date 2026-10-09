@@ -28,6 +28,7 @@ public:
     SDL_Window* GetSDLWindow() const { return window; }
     WindowSystemInfo GetWindowInfo() const { return window_info; }
     bool IsOpen() const { return is_open.load(std::memory_order_relaxed); }
+    u32 GetMouseButtons() const { return mouse_buttons.load(std::memory_order_relaxed); }
     /// Processes pending window events. Returns false once the user closed the window.
     bool PollEvents();
     /// Keyboard text entry for the system IME dialog; typed text shows in the title bar.
@@ -44,6 +45,11 @@ private:
     std::string text, text_prompt, base_title;
     void UpdateTextTitle();
     void UpdateCursor();
+    void UpdateMouseCapture();
+    void UpdateMouseButtons();
+    std::atomic<u32> mouse_buttons{};
+    u64 wheel_until[4]{};
+    bool mouse_captured{};
     u64 last_mouse_motion_ms{}; ///< SDL_GetTicks of the last mouse motion (UpdateCursor)
     bool cursor_hidden{};
     SDL_Window* window{};

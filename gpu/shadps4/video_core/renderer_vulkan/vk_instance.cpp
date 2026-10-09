@@ -11,6 +11,8 @@
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
+#include "video_core/renderer_vulkan/vk_breadcrumbs.h"
 #include "bbport_toggles.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -185,7 +187,15 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
 }
 
 Instance::~Instance() {
+    // NGX owns resources tied to this VkDevice. Its atexit fallback runs after a
+    // stack-owned Instance is gone, so release it here while the device is alive.
+    if (Dlss* dlss = Dlss::Get()) {
+        (void)GetDevice().waitIdle();
+        dlss->Shutdown();
+    }
     ImGui::Core::Shutdown(GetDevice());
+    (void)GetDevice().waitIdle();
+    Breadcrumbs::Shutdown(*this);
     vmaDestroyAllocator(allocator);
 }
 
@@ -238,7 +248,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 48> enabled_extensions;
+    boost::container::static_vector<const char*, 64> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -357,8 +367,12 @@ bool Instance::CreateDevice() {
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     // bbport: guest direct memory allocated here and mapped by the runtime (BbGuestMemory).
+#ifdef _WIN32
+    guest_memory_export = false;
+#else
     guest_memory_export = add_extension(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) &&
                           add_extension(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+#endif
     // bbport: FSR 4 v07 INT8 (vk_temporal_upscaler): quad derivatives in compute shaders.
     compute_shader_derivatives = add_extension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
     // bbport: FSR 4.1.1 passes (dot2 of halves accumulated in float, as vkd3d-proton translates them).
@@ -439,6 +453,18 @@ bool Instance::CreateDevice() {
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
+    // bbport: DLSS (optional bridge DLL) needs its own device extensions on NVIDIA GPUs.
+    std::vector<const char*> dlss_extensions;
+    if (Dlss* dlss = Dlss::Get()) {
+        dlss->AppendDeviceExtensions(*instance, physical_device, dlss_extensions);
+        for (const char* name : dlss_extensions) {
+            if (std::none_of(enabled_extensions.begin(), enabled_extensions.end(),
+                             [&](const char* e) { return std::string_view{e} == name; }) &&
+                enabled_extensions.size() < enabled_extensions.capacity()) {
+                enabled_extensions.push_back(name);
+            }
+        }
+    }
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = queue_info_count,
@@ -674,6 +700,9 @@ bool Instance::CreateDevice() {
     device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+    if (Dlss* dlss = Dlss::Get()) {
+        dlss->Initialize(*instance, physical_device, *device);
+    }
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);

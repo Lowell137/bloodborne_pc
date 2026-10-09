@@ -23,6 +23,7 @@ perf.data
 /bloodborne_upscalers_*.md
 mods.json
 patches.json
+!launcher/bloodborne.png
 # Local: game logs, messages and archives from users, internal plans
 /logs/
 /message*.txt

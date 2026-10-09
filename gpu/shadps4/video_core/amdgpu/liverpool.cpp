@@ -4,8 +4,10 @@
 #include <chrono>
 #include <thread>
 #include <pthread.h>
+#ifndef _WIN32
 #include <sys/resource.h>
 #include <sys/uio.h>
+#endif
 #include <unistd.h>
 #include <array>
 #include <time.h>
@@ -29,6 +31,7 @@
 #include "core/libraries/gnmdriver/gnmdriver.h"
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/amdgpu/command_dispatch.h"
 #include "bbport_write_log.h"
 #include "bbport_free_check.h"
 #include "video_core/amdgpu/pm4_cmds.h"
@@ -96,34 +99,34 @@ Liverpool::~Liverpool() {
 }
 
 void Liverpool::ProcessCommands() {
-    // Process incoming commands with high priority
-    while (num_commands) {
-        // bbport: commands touch the caches and record into the scheduler (readbacks:
-        // DownloadMemory copies and Finish()es), so the draw recording thread must be idle.
-        // Drained per command: draining only when the first check saw one let a command that
-        // arrived between the two checks run beside the recording thread — two threads in the
-        // scheduler's chunks (null chunk crashes in HandOver/SmallGuestCopy, lost chunks, hangs).
-        if (rasterizer) {
-            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands);
-        }
-        Common::UniqueFunction<void> callback{};
-        {
+    // Readbacks can record barriers/copies and submit work. Never run them alongside stage B.
+    // Keep the ownership transfer in the tested dispatcher: windows-v1.5 checked for work
+    // separately before draining, then checked again and could run a newly arrived command.
+    DispatchHostCommands(
+        [this] { return num_commands.load(std::memory_order_acquire) != 0; },
+        [this] {
             std::scoped_lock lk{submit_mutex};
-            callback = std::move(command_queue.front());
+            auto callback = std::move(command_queue.front());
             command_queue.pop();
             --num_commands;
-        }
-        callback();
-    }
+            return callback;
+        },
+        [this] {
+            if (rasterizer) {
+                rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands);
+            }
+        });
 }
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+#ifndef _WIN32
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
     }
+#endif
     gpu_id = std::this_thread::get_id();
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
     gpu_tid = gettid();
 #endif
 
@@ -1673,6 +1676,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
     if (seq != NoSeq && BbStats::enabled) {
         BbStats::submissions.fetch_add(1, std::memory_order_relaxed);
+#ifndef _WIN32 // bbport: per-thread rusage statistics are Linux-only
         if (rusage usage{}; getrusage(RUSAGE_THREAD, &usage) == 0) {
             BbStats::gpu_user_us.store(u64(usage.ru_utime.tv_sec) * 1000000 + usage.ru_utime.tv_usec,
                                        std::memory_order_relaxed);
@@ -1682,6 +1686,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             BbStats::gpu_vol_switches.store(usage.ru_nvcsw, std::memory_order_relaxed);
             BbStats::gpu_minor_faults.store(usage.ru_minflt, std::memory_order_relaxed);
         }
+#endif
     }
 
     if (copy && BbFreeCheck::Enabled()) {

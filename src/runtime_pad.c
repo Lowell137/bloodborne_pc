@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <time.h>
 #include <SDL3/SDL.h>
+#include "host_input.h"
 #include <sys/stat.h>
 
 #define ERR_INVALID_ARG ((int32_t)0x80920001)
@@ -84,7 +85,7 @@ static int is_preferred(SDL_JoystickID id, const char *want) {
     char guid[33];
     SDL_GUIDToString(SDL_GetGamepadGUIDForID(id),guid,sizeof guid);
     const char *name=SDL_GetGamepadNameForID(id);
-    return !strcasecmp(guid,want) || (name && strcasestr(name,want));
+    return !strcasecmp(guid,want) || (name && SDL_strcasestr(name,want));
 }
 /* The chosen gamepad, else the first while it is not connected (checked again every second, it
  * is taken as soon as it connects); called under lock. */
@@ -161,7 +162,12 @@ static const uint32_t input_buttons[IN_COUNT]={
 };
 #define MAX_BIND 4
 enum { PAD_LEFT_TRIGGER=SDL_GAMEPAD_BUTTON_COUNT, PAD_RIGHT_TRIGGER }; /* triggers as buttons */
-typedef struct { int key_count, pad_count; SDL_Scancode keys[MAX_BIND]; int pad[MAX_BIND]; } Binding;
+typedef struct {
+    int key_count, mouse_count, pad_count;
+    SDL_Scancode keys[MAX_BIND];
+    Uint32 mouse[MAX_BIND];
+    int pad[MAX_BIND];
+} Binding;
 static Binding bindings[IN_COUNT];
 static int bindings_ready;
 
@@ -218,15 +224,19 @@ static void load_bindings(void) {
         for (int i=0;i<IN_COUNT;++i) if (!strcmp(line+4,input_names[i])) input=i;
         if (input<0 || (pad && input>=IN_MOVE_UP)) { printf("Runtime: controls: unknown input %s\n",line); continue; }
         Binding *b=&bindings[input];
-        if (keyboard) b->key_count=0; else b->pad_count=0;
+        if (keyboard) b->key_count=b->mouse_count=0; else b->pad_count=0;
         for (char *name=strtok(eq+1,",\r\n"); name; name=strtok(NULL,",\r\n")) {
             while (*name==' ') ++name;
             for (char *end=name+strlen(name); end>name && end[-1]==' ';) *--end=0;
             if (!*name) continue;
             if (keyboard) {
-                const SDL_Scancode s=SDL_GetScancodeFromName(name);
-                if (s==SDL_SCANCODE_UNKNOWN) printf("Runtime: controls: unknown key \"%s\" for %s\n",name,line+4);
-                else if (b->key_count<MAX_BIND) b->keys[b->key_count++]=s;
+                const Uint32 mouse=bb_mouse_binding(name);
+                const SDL_Scancode s=mouse ? SDL_SCANCODE_UNKNOWN : bb_key_binding(name);
+                if (!mouse && s==SDL_SCANCODE_UNKNOWN) printf("Runtime: controls: unknown key \"%s\" for %s\n",name,line+4);
+                else if (b->key_count+b->mouse_count<MAX_BIND) {
+                    if (mouse) b->mouse[b->mouse_count++]=mouse;
+                    else b->keys[b->key_count++]=s;
+                }
             } else {
                 const int button=pad_button_from_name(name);
                 if (button<0) printf("Runtime: controls: unknown gamepad button \"%s\" for %s\n",name,line+4);
@@ -236,8 +246,9 @@ static void load_bindings(void) {
     }
     fclose(f);
 }
-static int key_down(const bool *k, int input) {
-    for (int i=0;i<bindings[input].key_count;++i) if (k[bindings[input].keys[i]]) return 1;
+static int key_down(const bool *k, Uint32 mouse, int input) {
+    for (int i=0;k && i<bindings[input].key_count;++i) if (k[bindings[input].keys[i]]) return 1;
+    for (int i=0;i<bindings[input].mouse_count;++i) if (mouse & bindings[input].mouse[i]) return 1;
     return 0;
 }
 /* The bound gamepad buttons' state; triggers as their analog value. */
@@ -257,17 +268,17 @@ static int pad_value(SDL_Gamepad *g, int input) {
 static uint8_t key_axis(uint8_t value, int negative, int positive) {
     return negative || positive ? (uint8_t)(128-(negative ? 128 : 0)+(positive ? 127 : 0)) : value;
 }
-static void apply_keyboard(PadData *d, const bool *k) {
+static void apply_keyboard(PadData *d, const bool *k, Uint32 mouse) {
     for (int i=IN_CROSS;i<=IN_RIGHT;++i)
-        if (i!=IN_TOUCHPAD && i!=IN_TOUCHPAD_RIGHT && key_down(k,i)) d->buttons|=input_buttons[i];
-    if (key_down(k,IN_TOUCHPAD)) touch_click(d,0);
-    if (key_down(k,IN_TOUCHPAD_RIGHT)) touch_click(d,1);
-    if (key_down(k,IN_L2)) d->l2=255;
-    if (key_down(k,IN_R2)) d->r2=255;
-    d->left_x=key_axis(d->left_x,key_down(k,IN_MOVE_LEFT),key_down(k,IN_MOVE_RIGHT));
-    d->left_y=key_axis(d->left_y,key_down(k,IN_MOVE_UP),key_down(k,IN_MOVE_DOWN));
-    d->right_x=key_axis(d->right_x,key_down(k,IN_LOOK_LEFT),key_down(k,IN_LOOK_RIGHT));
-    d->right_y=key_axis(d->right_y,key_down(k,IN_LOOK_UP),key_down(k,IN_LOOK_DOWN));
+        if (i!=IN_TOUCHPAD && i!=IN_TOUCHPAD_RIGHT && key_down(k,mouse,i)) d->buttons|=input_buttons[i];
+    if (key_down(k,mouse,IN_TOUCHPAD)) touch_click(d,0);
+    if (key_down(k,mouse,IN_TOUCHPAD_RIGHT)) touch_click(d,1);
+    if (key_down(k,mouse,IN_L2)) d->l2=255;
+    if (key_down(k,mouse,IN_R2)) d->r2=255;
+    d->left_x=key_axis(d->left_x,key_down(k,mouse,IN_MOVE_LEFT),key_down(k,mouse,IN_MOVE_RIGHT));
+    d->left_y=key_axis(d->left_y,key_down(k,mouse,IN_MOVE_UP),key_down(k,mouse,IN_MOVE_DOWN));
+    d->right_x=key_axis(d->right_x,key_down(k,mouse,IN_LOOK_LEFT),key_down(k,mouse,IN_LOOK_RIGHT));
+    d->right_y=key_axis(d->right_y,key_down(k,mouse,IN_LOOK_UP),key_down(k,mouse,IN_LOOK_DOWN));
 }
 
 static void sample_host(PadData *d) {
@@ -307,7 +318,7 @@ static void sample_host(PadData *d) {
         if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,0);
         if (touch_right) touch_click(d,1);
     }
-    if (k) apply_keyboard(d,k);
+    apply_keyboard(d,k,bbgpu_mouse_buttons());
 }
 
 /* BB_PAD_FILE=<file>: scripted input for automated runs. The file holds whitespace-separated
@@ -327,8 +338,14 @@ static void read_inject(void) {
     last_check=now;
     struct stat st;
     if (stat(path,&st)!=0) return;
+#ifdef _WIN32
+    /* Whole-second mtimes: the size tells two edits within a second apart. */
+    if (st.st_mtime==mtime.tv_sec && st.st_size==mtime.tv_nsec) return;
+    mtime=(struct timespec){st.st_mtime,(long)st.st_size};
+#else
     if (st.st_mtim.tv_sec==mtime.tv_sec && st.st_mtim.tv_nsec==mtime.tv_nsec) return;
     mtime=st.st_mtim;
+#endif
     FILE *f=fopen(path,"r");
     if (!f) return;
     static const struct { const char *name; uint32_t ps; } names[]={
@@ -423,6 +440,9 @@ static void replay_sample(PadData *d) {
     d->left_x=s->axes[0]; d->left_y=s->axes[1]; d->right_x=s->axes[2]; d->right_y=s->axes[3];
     d->l2=s->l2; d->r2=s->r2;
 }
+/* After the menu or the text dialog closes, buttons still held (the Cross that accepted a
+ * name) stay hidden until released: the game would take them as a new press. */
+static int hold_after_capture;
 /* Touches as the DualShock 4 reports them: every finger that goes down gets a new id (1..127, kept
  * while it stays down) and the time since the first one went down. With id 0 and no hold time
  * the game ignored touchpad presses: no gesture menu from the touchpad, Back or Tab. */
@@ -440,7 +460,10 @@ static void touch_ids(PadData *d) {
 }
 static void sample(PadData *d) {
     sample_host(d);
-    if (bbgpu_overlay_captures_input()) return;
+    if (bbgpu_overlay_captures_input()) {
+        bbgpu_camera_stick(128,128);
+        hold_after_capture=1; touch_ids(d); return;
+    }
     record_sample(d);
     read_inject();
     replay_sample(d);
@@ -451,7 +474,17 @@ static void sample(PadData *d) {
     if (injected.buttons & BTN_R2) d->r2=255;
     uint8_t *axes[4]={&d->left_x,&d->left_y,&d->right_x,&d->right_y};
     for (int i=0;i<4;++i) if (injected.stick[i]>=0) *axes[i]=(uint8_t)injected.stick[i];
+    if (hold_after_capture) {
+        if (d->buttons || d->l2 || d->r2 || d->touch_count) {
+            d->buttons=0;
+            d->l2=d->r2=0;
+            d->touch_count=0;
+            memset(d->touches,0,sizeof(d->touches));
+        }
+        else hold_after_capture=0;
+    }
     touch_ids(d);
+    bbgpu_camera_stick(d->right_x,d->right_y);
 }
 
 static ABI int32_t pad_init(void) { pthread_mutex_lock(&lock); initialized=1; pthread_mutex_unlock(&lock); return 0; }

@@ -2,9 +2,12 @@
 #include "bbport_gnm_hooks.h"
 // bbport: glue between the C loader and the vendored shadPS4 video core.
 #include "bbport_overlay.h"
+#include "bbport_mouse.h"
 #include "bbport_settings.h"
 #include "bbport_copy.h"
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 #include "bbport_free_check.h"
 #include "bbport_toggles.h"
 #include <algorithm>
@@ -263,9 +266,13 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     StartProfileWriter();
 #endif
     g_sdk_version = config->sdk_version;
+#ifdef _WIN32
+    if (config->user_dir && !std::getenv("BB_GPU_USER_DIR")) _putenv_s("BB_GPU_USER_DIR", config->user_dir);
+#else
     if (config->user_dir) setenv("BB_GPU_USER_DIR", config->user_dir, 0);
+#endif
     Core::Emulator::FillElfInfo(*config);
-    const std::string title = config->title ? config->title : "Bloodborne";
+    const std::string title = std::string(config->title ? config->title : "Bloodborne") + " — bbport " + bbgpu_version();
     const s32 width = config->width, height = config->height;
     g_window_thread = std::thread([title, width, height] {
         Common::SetCurrentThreadName("bb:window");
@@ -277,7 +284,8 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
         }
         g_window_cv.notify_all();
         while (window->PollEvents()) {
-            SDL_Delay(2);
+            // Wait wakes immediately on input, rather than adding a polling delay.
+            SDL_WaitEventTimeout(nullptr, 8);
         }
         LOG_INFO(Frontend, "Window closed by user");
         std::fflush(stdout);
@@ -329,6 +337,7 @@ extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
 
 extern "C" void bbgpu_patch_image(unsigned char* image, uint64_t size) {
     BbGnmHooks::PatchImage(image, size);
+    BbMouse::Install(image, size);
 }
 
 extern "C" unsigned bbgpu_symbol_count(void) {
@@ -388,6 +397,14 @@ ScreenshotRequests ConsumeScreenshotRequests() { return {}; }
 
 extern "C" int bbgpu_overlay_captures_input(void) {
     return BbOverlay::CapturesInput() ? 1 : 0;
+}
+
+extern "C" uint32_t bbgpu_mouse_buttons(void) {
+    return g_window ? g_window->GetMouseButtons() : 0;
+}
+
+extern "C" void bbgpu_camera_stick(uint8_t x, uint8_t y) {
+    BbMouse::Stick(x, y);
 }
 
 extern "C" int bbgpu_text_input_begin(const char* initial, const char* prompt) {
