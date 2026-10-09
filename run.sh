@@ -19,6 +19,8 @@ data=${BB_DATA_DIR:-.}
 out=$data/out
 mkdir -p "$out"
 export BB_CONFIG=${BB_CONFIG:-$data/bbport.ini}
+# Cap texture cache budget at 3200 MiB to prevent VRAM exhaustion on 8 GB GPUs
+export BB_GC_BUDGET_MB=${BB_GC_BUDGET_MB:-3200}
 # FSR 4.1.1 assets (tools/fsr4cap/build_assets.sh): next to run.sh or in the data directory.
 if [[ -z ${BB_FSR411_DIR:-} && ! -d fsr4_411 && -d $data/fsr4_411 ]]; then
     export BB_FSR411_DIR=$data/fsr4_411
