@@ -958,6 +958,15 @@ class LauncherWindow(Adw.ApplicationWindow):
         self.fsr411_row.add_suffix(self.fsr411_button)
         self.fsr411_row.set_visible((FSR4CAP_DIR / "build_assets.sh").is_file())
         upscaler.add(self.fsr411_row)
+        # DLSS: NVIDIA's library, chosen like the FSR 4.1.1 DLL (the package may bring one).
+        self.dlss_row = Adw.ActionRow(title=tr("DLSS: библиотека NVIDIA"))
+        self.dlss_row.add_suffix(flat_button("document-open-symbolic", tr("Выбрать файл…"),
+                                             lambda _b: self.choose_ngx()))
+        self.dlss_reset_button = flat_button("edit-undo-symbolic", tr("Убрать выбранную"),
+                                             lambda _b: self.reset_ngx())
+        self.dlss_row.add_suffix(self.dlss_reset_button)
+        upscaler.add(self.dlss_row)
+        self.update_dlss_row()
         self.update_fsr411_row()
         self.preset_row = combo_row(tr("Пресет"), None, PRESETS, int(self.ini.get("preset", "4")))
         self.preset_row.connect("notify::selected", lambda *_: self.update_upscaler_status())
@@ -1018,7 +1027,40 @@ class LauncherWindow(Adw.ApplicationWindow):
                                     "из мода Nexus #253"))
             self.effect_rows[key] = row
             effects.add(row)
+        # The title's "play online / play offline": the port has no PSN.
+        self.skip_network_row = Adw.SwitchRow(
+            title=tr("Пропускать выбор «по сети / вне сети»"),
+            subtitle=tr("Игра сразу открывает главное меню в режиме вне сети (патч игры)"),
+            active=self.settings.get("skip_network_choice", True))
+        effects.add(self.skip_network_row)
         display_page.add(effects)
+        # Auto: the new memory model on AMD, the 0.3 one elsewhere; or either by hand.
+        mode = Adw.PreferencesGroup(title=tr("Режим работы"))
+        self.memory_model_row = combo_row(tr("Модель памяти и трансляции"), tr(PC_MODEL_SUBTITLE),
+                                          MEMORY_MODELS, self.settings.get("memory_model", "auto"))
+        mode.add(self.memory_model_row)
+        display_page.add(mode)
+        # Mouse look (runtime_pad.c): a click in the game takes the mouse, F1 lets it go.
+        mouse = Adw.PreferencesGroup(title=tr("Мышь"))
+        self.mouse_look_row = Adw.SwitchRow(
+            title=tr("Камера мышью"),
+            subtitle=tr("Щелчок в окне игры захватывает мышь, F1 — отпускает"),
+            active=self.ini.get("mouse_look", "1") == "1")
+        mouse.add(self.mouse_look_row)
+        self.mouse_sensitivity_row = Adw.SpinRow.new_with_range(0.1, 10.0, 0.05)
+        self.mouse_sensitivity_row.set_title(tr("Чувствительность мыши"))
+        self.mouse_sensitivity_row.set_digits(2)
+        self.mouse_sensitivity_row.set_value(float(self.ini.get("mouse_sensitivity", "1.0")))
+        mouse.add(self.mouse_sensitivity_row)
+        self.mouse_invert_row = Adw.SwitchRow(title=tr("Инвертировать мышь по вертикали"),
+                                              active=self.ini.get("mouse_invert_y") == "1")
+        mouse.add(self.mouse_invert_row)
+        def mouse_rows_sensitive(*_):
+            for row in (self.mouse_sensitivity_row, self.mouse_invert_row):
+                row.set_sensitive(self.mouse_look_row.get_active())
+        self.mouse_look_row.connect("notify::active", mouse_rows_sensitive)
+        mouse_rows_sensitive()
+        display_page.add(mouse)
         dialog.add(display_page)
 
         # 2. Page: Controls
