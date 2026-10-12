@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -14,6 +15,7 @@
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_breadcrumbs.h"
 #include "bbport_toggles.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -22,6 +24,22 @@
 namespace Vulkan {
 
 namespace {
+
+/// bbport BB_VRAM_LIMIT_MB=N (tests): the driver's VRAM budget taken as at most N MiB, at startup
+/// and while the game runs, so the texture collector and VRAM copies behave as on a smaller card
+/// (a 6 GB GTX 1660 Ti reports ~5600). Allocations themselves are not limited.
+u64 VramLimit() {
+    static const u64 limit = [] {
+        const char* env = std::getenv("BB_VRAM_LIMIT_MB");
+        const u64 mib = env && *env ? std::strtoull(env, nullptr, 10) : 0;
+        if (mib != 0) {
+            std::printf("GPU: VRAM budget limited to %llu MiB (BB_VRAM_LIMIT_MB)\n",
+                        (unsigned long long)mib);
+        }
+        return mib << 20;
+    }();
+    return limit;
+}
 
 std::vector<vk::PhysicalDevice> EnumeratePhysicalDevices(vk::UniqueInstance& instance) {
     auto [devices_result, devices] = instance->enumeratePhysicalDevices();
@@ -490,6 +508,8 @@ bool Instance::CreateDevice() {
                 .wideLines = features.wideLines,
                 .multiViewport = features.multiViewport,
                 .samplerAnisotropy = features.samplerAnisotropy,
+                // bbport: exact sample counts for the game's occlusion queries (vk_occlusion.h).
+                .occlusionQueryPrecise = features.occlusionQueryPrecise,
                 .vertexPipelineStoresAndAtomics = features.vertexPipelineStoresAndAtomics,
                 .fragmentStoresAndAtomics = features.fragmentStoresAndAtomics,
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
@@ -823,6 +843,17 @@ void Instance::CollectDeviceParameters() {
     const std::string api_version = GetReadableVersion(properties.apiVersion);
     const std::string extensions = fmt::format("{}", fmt::join(available_extensions, ", "));
 
+    // bbport: in every log (reports of hangs and device loss need it; LOG_INFO is filtered out).
+    u64 device_local = 0;
+    for (u32 i = 0; i < memory_properties.memoryHeapCount; ++i) {
+        if (memory_properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+            device_local = std::max<u64>(device_local, memory_properties.memoryHeaps[i].size);
+        }
+    }
+    std::printf("GPU: %s%s, %llu MiB VRAM; %s %s (%s), Vulkan %s\n", model_name.c_str(),
+                IsIntegrated() ? " (integrated)" : "",
+                static_cast<unsigned long long>(device_local >> 20), vendor_name.c_str(),
+                driver_version.c_str(), driver.driverInfo.data(), api_version.c_str());
     LOG_INFO(Render_Vulkan, "GPU_Vendor: {}", vendor_name);
     LOG_INFO(Render_Vulkan, "GPU_Model: {}", model_name);
     LOG_INFO(Render_Vulkan, "GPU_Integrated: {}", IsIntegrated() ? "Yes" : "No");
@@ -861,6 +892,9 @@ void Instance::CollectPhysicalMemoryInfo() {
         }
         // If memory budget is not supported, use the size of the heap as the budget.
         total_memory_budget += memory_props.memoryHeaps[i].size;
+    }
+    if (VramLimit() != 0) {
+        total_memory_budget = std::min(total_memory_budget, VramLimit());
     }
     if (!IsIntegrated()) {
         // We reserve some memory for the system.
@@ -956,7 +990,7 @@ u64 Instance::GetDeviceMemoryBudgetNow() const {
     for (const size_t heap : valid_heaps) {
         total_budget += memory_budget_props.heapBudget[heap];
     }
-    return total_budget;
+    return VramLimit() != 0 ? std::min(total_budget, VramLimit()) : total_budget;
 }
 
 vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const {

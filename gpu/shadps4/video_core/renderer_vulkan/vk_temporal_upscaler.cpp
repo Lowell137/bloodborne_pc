@@ -397,6 +397,18 @@ bool TemporalUpscaler::OnFrameStart() {
     last_jitter = jitter_on;
     dispatched_last_frame = false;
 
+    // Diagnostics BB_UI_TRACE=1: the draws of frames that ended without the output-size UI
+    // (their display buffer is shown as the game drew it, at its own size), and of one that had it.
+    if (ui_trace_on) {
+        static int bad = 0, good = 0;
+        if ((!ui_phase && Scaled() && good > 0 && bad < 12) || (ui_phase && good < 1)) {
+            ++(ui_phase ? good : bad);
+            std::printf("UI trace: frame %llu %s:%s\n",
+                        (unsigned long long)BbStats::frame_number.load(std::memory_order_relaxed),
+                        ui_phase ? "with the output-size UI" : "WITHOUT it", ui_trace.c_str());
+        }
+        ui_trace.clear();
+    }
     // The display pass of an upscaled frame reads the upscaled UI image.
     display_redirect = ui_phase;
     ui_phase = false;
@@ -1457,6 +1469,22 @@ void TemporalUpscaler::OnColorTarget(VideoCore::ImageId color) {
 void TemporalUpscaler::OnDraw(u64 vs_hash, VideoCore::ImageId color,
                               VideoCore::ImageId depth, bool native_viewport) {
     if (!Scaled() && vs_hash == ui_trigger_vs) done_this_frame = true;
+    // bbport (issue #67, patch by bmy): a UI draw without a color target (a Scaleform mask, color
+    // writes off) writes the stencil the UI's next draws test, so it must go into the UI's
+    // output-size depth like them. Left in the guest depth, the mask was lost when the next UI
+    // draw switched to the UI depth (PrepareUiDepth clears its stencil): masked images (the
+    // loading screen's item picture, cut out of a sheet) vanished.
+    if (ui_phase && !color && depth && depth != ui_depth && ui_color) {
+        const auto& depth_image = texture_cache.GetImage(depth);
+        const auto& ui_target = texture_cache.GetImage(ui_color);
+        if (depth_image.info.size.width == ui_target.info.size.width &&
+            depth_image.info.size.height == ui_target.info.size.height) {
+            EnsureUiResources(ui_width, ui_height, ui_format, depth_image.info.pixel_format);
+            PrepareUiDepth(depth);
+            ui_depth = depth;
+        }
+        return;
+    }
     if (!Scaled() || !color) {
         return;
     }
@@ -1473,6 +1501,12 @@ void TemporalUpscaler::OnDraw(u64 vs_hash, VideoCore::ImageId color,
     const auto& image = texture_cache.GetImage(color);
     const bool movie = vs_hash == ui_trigger_vs || UiComposition::MovieShader(vs_hash) ||
                        (scaled_session && native_viewport);
+    if (ui_trace_on && ui_trace.size() < 1500) {
+        ui_trace += fmt::format(" [vs {:x} {}x{} fmt {} movie {} display {}]", vs_hash,
+                                image.info.size.width, image.info.size.height,
+                                u32(image.info.pixel_format), movie ? 1 : 0,
+                                FrameCapture::IsDisplayBuffer(image.info.guest_address) ? 1 : 0);
+    }
     const bool ui_draw = movie &&
         (image.info.pixel_format == vk::Format::eR8G8B8A8Unorm ||
          image.info.pixel_format == vk::Format::eR8G8B8A8Srgb) &&

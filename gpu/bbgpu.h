@@ -33,6 +33,13 @@ int bbgpu_text_input_poll(char *out_utf8, uint64_t size);
 int bbgpu_overlay_captures_input(void);
 /* Window-thread snapshot: SDL mouse-button masks plus BB_WHEEL_* from host_input.h. */
 uint32_t bbgpu_mouse_buttons(void);
+/* Mouse look (runtime_pad.c): the window takes the mouse when it is clicked (relative mode) and
+ * lets it go on F1, losing focus or the menu opening. take: motion (pixels) and wheel notches
+ * since the last call, reset; captured: 1 while the window holds it; enable: mouse_look=0 in
+ * bbport.ini keeps the window from taking it. */
+void bbgpu_mouse_take(double *dx, double *dy, int *wheel_up, int *wheel_down);
+int bbgpu_mouse_captured(void);
+void bbgpu_mouse_look_enable(int enabled);
 /* Final right-stick axes (also keyboard look): native camera ownership handoff. */
 void bbgpu_camera_stick(uint8_t x, uint8_t y);
 /* Patches the loaded image before the game runs (image still writable): libGnm entry hooks. */

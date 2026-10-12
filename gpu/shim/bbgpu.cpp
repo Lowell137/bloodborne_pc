@@ -1,9 +1,11 @@
 #include "bbport_write_log.h"
+#include "bbport_game_menu.h"
 #include "bbport_gnm_hooks.h"
 // bbport: glue between the C loader and the vendored shadPS4 video core.
 #include "bbport_overlay.h"
 #include "bbport_mouse.h"
 #include "bbport_settings.h"
+#include "game_profile.h"
 #include "bbport_copy.h"
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -191,6 +193,9 @@ void MemoryManager::CopySparseMemory(VAddr source, u8* dest, u64 size) {
         CopySparseSerial(source + offset, dest + offset, std::min(Chunk, size - offset));
     });
 }
+void MemoryManager::ReadBacking(VAddr address, void* data, u64 size) {
+    runtime_memory_read_backing(address, data, size);
+}
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     BbWriteLog::Note(reinterpret_cast<uintptr_t>(address), data, size, BbWriteLog::Backing);
     return runtime_memory_write_backing(reinterpret_cast<uintptr_t>(address), data, size) != 0;
@@ -262,6 +267,8 @@ static void StartProfileWriter() {
 
 extern "C" int bbgpu_init(const BbGpuConfig* config) {
     BbSettings::Load();
+    // What the translator knows about this game (games/), before anything asks for it.
+    Game::Select(config->serial);
 #ifdef BB_PGO_GENERATE
     StartProfileWriter();
 #endif
@@ -401,6 +408,26 @@ extern "C" int bbgpu_overlay_captures_input(void) {
 
 extern "C" uint32_t bbgpu_mouse_buttons(void) {
     return g_window ? g_window->GetMouseButtons() : 0;
+}
+
+extern "C" void bbgpu_mouse_take(double* dx, double* dy, int* wheel_up, int* wheel_down) {
+    double x = 0, y = 0;
+    int up = 0, down = 0;
+    if (g_window) {
+        g_window->TakeMouse(x, y, up, down);
+    }
+    *dx = x;
+    *dy = y;
+    *wheel_up = up;
+    *wheel_down = down;
+}
+
+extern "C" int bbgpu_mouse_captured(void) {
+    return g_window && g_window->MouseCaptured() ? 1 : 0;
+}
+
+extern "C" void bbgpu_mouse_look_enable(int enabled) {
+    Frontend::WindowSDL::EnableMouseLook(enabled != 0);
 }
 
 extern "C" void bbgpu_camera_stick(uint8_t x, uint8_t y) {

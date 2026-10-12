@@ -11,9 +11,6 @@ pipelineExecutableInfo).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/ffx_vk_fsr4_v07.c | 109 ++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 109 insertions(+)
-
 diff --git a/src/ffx_vk_fsr4_v07.c b/src/ffx_vk_fsr4_v07.c
 index c30f7cf..eb42c16 100644
 --- a/src/ffx_vk_fsr4_v07.c
@@ -205,6 +202,3 @@ index c30f7cf..eb42c16 100644
          if (vkResetDescriptorPool(c->dev, c->pool[i], 0) != VK_SUCCESS)
              return VK_ERROR_DEVICE_LOST;
          memset(frame, 0, sizeof(*frame));
--- 
-2.55.0
-
