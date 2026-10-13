@@ -175,6 +175,15 @@ DEFAULTS = {
     "gpu_profile": False,
     "vk_validation": False,
     "extra_env": "",
+    # Online play (Online page, the online module gpu/bbnet): off by default; shadPS4's public
+    # shadNet server and The Hunter's Dream.
+    "online": False,
+    "online_community": online.COMMUNITY_SERVER,
+    "online_server": online.SHADNET_SERVER,
+    "online_webapi": "",
+    "online_npid": "",
+    "online_password": "",
+    "online_upnp": True,
     "playtime_seconds": 0,
     "play_count": 0,
     "last_played": "",
@@ -656,6 +665,8 @@ class LauncherWindow(Adw.ApplicationWindow):
                                         "input-gaming-symbolic")
         self.stack.add_titled_with_icon(self.build_trophies_page(), "trophies", tr("Трофеи"),
                                         "games-achievements-symbolic")
+        self.stack.add_titled_with_icon(self.build_online_page(), "online", tr("Онлайн"),
+                                        "network-workgroup-symbolic")
         self.stack.add_titled_with_icon(self.build_log_page(), "log", tr("Журнал"),
                                         "utilities-terminal-symbolic")
         self.log_view.get_buffer().set_text(log_text)
