@@ -13,11 +13,9 @@
 #include <time.h>
 #include <dirent.h>
 #include <errno.h>
+#include <ftw.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#ifndef _WIN32
-#include <ftw.h>
-#endif
 
 #define ERR_PARAMETER ((int32_t)0x809F0000)
 #define ERR_NOT_INITIALIZED ((int32_t)0x809F0001)
@@ -142,17 +140,12 @@ static int read_param(const char *meta, Param *p) {
     if (!f) return -1;
     size_t n=fread(p,sizeof(*p),1,f); fclose(f);
     struct stat st;
-    if (!stat(path,&st)) p->mtime=st.st_mtime;
+    if (!stat(path,&st)) p->mtime=st.st_mtim.tv_sec;
     return n==1 ? 0 : -1;
 }
-#ifdef _WIN32
-static void remove_tree(const char *path) { compat_remove_tree(path); }
-#else
 static int remove_entry(const char *path, const struct stat *st, int flag, struct FTW *ftw) {
     (void)st; (void)flag; (void)ftw; return remove(path);
 }
-static void remove_tree(const char *path) { nftw(path,remove_entry,16,FTW_DEPTH|FTW_PHYS); }
-#endif
 
 static ABI int32_t save_initialize(const void *param) { (void)param; initialized=1; return 0; }
 static ABI int32_t save_terminate(void) {
@@ -260,8 +253,8 @@ static ABI int32_t save_delete(const Delete *d) {
     snprintf(meta,sizeof(meta),"%s/%s.sce_sys",base,d->dir->data);
     struct stat st;
     if (stat(host,&st)) return ERR_NOT_FOUND;
-    remove_tree(host);
-    remove_tree(meta);
+    nftw(host,remove_entry,16,FTW_DEPTH|FTW_PHYS);
+    nftw(meta,remove_entry,16,FTW_DEPTH|FTW_PHYS);
     printf("Runtime: save data '%s' deleted\n",d->dir->data);
     return 0;
 }
@@ -365,4 +358,3 @@ static const RuntimeExport exports[]={
 };
 uintptr_t runtime_savedata_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 void runtime_savedata_report(void) { printf("Runtime: save data mounts=%zu, memory writes=%zu\n",mounts_done,memory_writes); }
-

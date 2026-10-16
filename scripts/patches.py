@@ -18,6 +18,15 @@ EBOOT_BASE=0x400000
 # half speed (the game's wall detector measured distance per frame, a 30 FPS rule).
 FPS_PRESETS={'30':[],'60':['60 FPS++'],'90':['90 FPS++','Sprint Fix (High FPS)'],
              'uncap':['Uncap FPS++','Sprint Fix (High FPS)']}
+# Above 30 FPS the frame rate is done by hooks in the game's code (gpu/shim/bbport_frame_rate.cpp:
+# 60 and 90 are the same as uncap, at most that many frames a second): no patches. The patches
+# only with BB_FRAME_HOOKS=0 (comparisons).
+
+
+def fps_patches(fps, env=os.environ):
+    if fps!='30' and env.get('BB_FRAME_HOOKS','1')!='0':
+        return []
+    return FPS_PRESETS[fps]
 # Upscaler presets (bbport.ini "preset", the in-game menu): output / render size ratio. The game
 # then renders at 1920x1080 / ratio and the port's temporal upscaler restores the output size.
 OUTPUT_SIZE=(1920,1080)
@@ -39,17 +48,6 @@ EFFECTS={
     'skip_intro':(None,'Skip Intro'),
     'debug_camera':(None,'Restore Debug Camera'),
     'debug_menu':(None,'Restore Debug Menu (READ NOTES)'),
-    # Cheats and gameplay tweaks (launcher "Cheats" page).
-    'cheat_no_death':(None,'Player No Dead (Read note)'),
-    'cheat_stealth':(None,'Player Stealth (Read note)'),
-    'cheat_silent':(None,'Player Silent (Read note)'),
-    'cheat_rally_no_decay':(None,'No Rally Decay'),
-    'cheat_enemy_control':(None,'Enemy Control'),
-    'tweak_no_rally':(None,'Disable Rally (HP Regain)'),
-    'tweak_camera_distance':(None,'Increased camera distance'),
-    'tweak_no_camera_rotation':(None,'Disable Camera Auto Rotation via Movement'),
-    'tweak_easy_run':(None,'Sensitive Analog Input (easier to run)'),
-    'tweak_ragdoll':(None,'DS1-like physics'),
 }
 # Intel CPUs: the game's tone mapping turns black (DLC areas most; reported as darker than on the
 # PS4): the game code runs natively, and Intel's approximate float instructions differ from the
@@ -81,15 +79,6 @@ def intel_tonemap_fix(env=os.environ, cpuinfo='/proc/cpuinfo'):
 
 # model_lod: -2 highest, 0 the game's, 1 lower, 2 lowest.
 MODEL_LOD={'-2':'Model LOD -2 (Highest)','1':'Model LOD 1 (Lower)','2':'Model LOD 2 (Lowest)'}
-
-
-def game_app_version(game):
-    """APP_VER of the game folder's param.sfo ("01.09"), or None when it cannot be read."""
-    try:
-        from prepare import sfo
-        return sfo((Path(game) / 'sce_sys/param.sfo').read_bytes()).get('APP_VER')
-    except (OSError, ValueError, ImportError):
-        return None
 
 
 DEBUG_MENU='Restore Debug Menu (READ NOTES)'
@@ -157,13 +146,6 @@ def effect_patches(settings):
         if key not in settings: continue
         name=on if settings[key]=='1' else off
         if name: names.append(name)
-    # Enemy Control and the free camera use the same buttons: the free camera wins.
-    if 'Enemy Control' in names and 'Restore Debug Camera' in names:
-        names.remove('Enemy Control')
-        print('Patches: Enemy Control skipped (it conflicts with the free camera)')
-    # Rally that never decays means nothing without Rally.
-    if 'No Rally Decay' in names and 'Disable Rally (HP Regain)' in names:
-        names.remove('No Rally Decay')
     lod=MODEL_LOD.get(settings.get('model_lod','0'))
     if lod: names.append(lod)
     return names
@@ -271,12 +253,9 @@ def compile_patches(xml, names, app_version, segments):
         if meta.get('Name') in names and meta.get('AppVer')==app_version and meta.get('AppElf','eboot.bin')=='eboot.bin':
             found[meta.get('Name')]=meta
     missing=[n for n in names if n not in found]
-    if missing:
-        print(f'Patches: WARNING: patches not found for app version {app_version}: {missing}', file=sys.stderr)
+    if missing: raise ValueError(f'patches not found for app version {app_version}: {missing}')
     writes=[]
     for name in names:
-        if name not in found:
-            continue
         for line in found[name].iter('Line'):
             offset=int(line.get('Address'),0)-EBOOT_BASE
             data=encode(line)
@@ -292,23 +271,13 @@ BLOODBORNE_IDS={'CUSA00900','CUSA00207','CUSA00208','CUSA00299','CUSA01363',
                 'CUSA03179','CUSA03173','CUSA03014','CUSA03023'}
 
 
-BUILTIN_PATCH_NAMES = set()
-for fps_list in FPS_PRESETS.values():
-    BUILTIN_PATCH_NAMES.update(fps_list)
-for off, on in EFFECTS.values():
-    if off: BUILTIN_PATCH_NAMES.add(off)
-    if on: BUILTIN_PATCH_NAMES.add(on)
-BUILTIN_PATCH_NAMES.update(MODEL_LOD.values())
-BUILTIN_PATCH_NAMES.add(INTEL_TONEMAP)
-
-
-def external_patches(directory, app_version='01.09', exclude=None):
+def external_patches(directory, app_version='01.09', exclude=Path(__file__).resolve().parent.parent/'patches/Bloodborne.xml'):
     """[(key, file, metadata)] of eboot patches for this version in directory/*.xml.
     key is "<file name>/<patch name>" (the launcher's selection, patches.json)."""
     found=[]
     directory=Path(directory)
-    builtin_xml = Path(__file__).resolve().parent.parent / 'patches/Bloodborne.xml'
     for path in sorted(directory.glob('*.xml')) if directory.is_dir() else []:
+        if path.resolve()==Path(exclude).resolve(): continue  # the built-in file (patches/ in a checkout)
         try:
             root=ET.parse(path).getroot()
         except ET.ParseError as error:
@@ -316,13 +285,9 @@ def external_patches(directory, app_version='01.09', exclude=None):
             continue
         ids={e.text.strip() for e in root.iter('ID') if e.text}
         if ids and not ids&BLOODBORNE_IDS: continue
-        is_builtin = (path.name == 'Bloodborne.xml' or (builtin_xml.is_file() and path.resolve() == builtin_xml.resolve()))
         for meta in root.iter('Metadata'):
             if meta.get('AppVer')==app_version and meta.get('AppElf','eboot.bin')=='eboot.bin':
-                name = meta.get('Name')
-                if is_builtin and name in BUILTIN_PATCH_NAMES:
-                    continue
-                found.append((f'{path.name}/{name}',path,meta))
+                found.append((f'{path.name}/{meta.get("Name")}',path,meta))
     return found
 
 
@@ -333,15 +298,8 @@ def external_selection(found, config):
     if config and Path(config).is_file():
         settings=json.loads(Path(config).read_text(encoding='utf-8'))
     enabled,disabled=set(settings.get('enabled',[])),set(settings.get('disabled',[]))
-    res = []
-    for key, path, meta in found:
-        if key in enabled:
-            res.append((key, path, meta))
-        elif key not in disabled and meta.get('isEnabled','false').lower()=='true':
-            if path.name == 'Bloodborne.xml':
-                continue
-            res.append((key, path, meta))
-    return res
+    return [(key,path,meta) for key,path,meta in found
+            if key in enabled or (key not in disabled and meta.get('isEnabled','false').lower()=='true')]
 
 
 def compile_external(selected, segments):
@@ -394,16 +352,7 @@ def main():
         size=render_size(settings)
         if size: print(f'{size[0]}x{size[1]}')
         return
-    # The patches are byte writes at the addresses of one game version: on another version they
-    # would corrupt code. Such a game runs unpatched (run.sh/run.py then choose 30 FPS).
-    version=game_app_version(a.game_dir)
-    if version and version!=a.app_version and not os.environ.get('BB_FORCE_PATCHES'):
-        blob=struct.pack('<8sQQ',b'BBPATCH2',EBOOT_BASE,0)
-        (a.out/'patches.bin').write_bytes(blob)
-        print(f'Patches: game version {version}, patches are for {a.app_version}: none applied '
-              '(30 FPS, no effect or resolution patches)')
-        return
-    names=FPS_PRESETS[a.fps]+[n.strip() for n in a.extra.split(';') if n.strip()]
+    names=fps_patches(a.fps)+[n.strip() for n in a.extra.split(';') if n.strip()]
     names+=[n for n in effect_patches(read_settings(a.settings)) if n not in names]
     if intel_tonemap_fix() and INTEL_TONEMAP not in names:
         names.append(INTEL_TONEMAP)

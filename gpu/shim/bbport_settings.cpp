@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_settings.h"
+#include <cmath>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <cmath>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -33,34 +31,13 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         if (value == "en") v.menu_language = MenuLanguage::English;
         else if (value == "ru") v.menu_language = MenuLanguage::Russian;
         else std::printf("Settings: unknown menu_language '%s' (expected en or ru)\n", value.c_str());
+        v.menu_language_chosen = value == "en" || value == "ru";
     } else if (key == "upscaler") {
         for (int u = 0; u < UpscalerCount; ++u) {
             if (value == UpscalerName(u)) {
                 v.upscaler = u;
             }
         }
-    } else if (key == "frame_generation") {
-        v.frame_generation = value == "fsr"    ? FrameGenerationFsr
-                             : value == "dlss" ? FrameGenerationDlss
-                                               : FrameGenerationOff;
-    } else if (key == "dlss_preset") {
-        std::string name = value;
-        const auto first = name.find_first_not_of(" \t");
-        name = first == std::string::npos ? "" : name.substr(first);
-        const auto last = name.find_last_not_of(" \t");
-        if (last != std::string::npos) name.resize(last + 1);
-        for (char& c : name) {
-            if (c >= 'a' && c <= 'z') c -= 'a' - 'A';
-        }
-        v.dlss_preset = 0;
-        if (name == "AUTO" || name == "DEFAULT" || name == "0") return;
-        for (int preset : DlssPresets) {
-            if (name == DlssPresetName(preset) || name == std::to_string(preset)) {
-                v.dlss_preset = preset;
-                return;
-            }
-        }
-        std::printf("Settings: unknown DLSS model preset '%s'; using Auto\n", value.c_str());
     } else if (key == "preset") {
         v.preset = std::clamp(i, 0, PresetCount - 1);
     } else if (key == "sharpen") {
@@ -83,15 +60,6 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
     } else if (key == "show_fps") {
         v.show_fps = i != 0;
-    } else if (key == "mouse_camera") {
-        v.mouse_camera = i != 0;
-    } else if (key == "mouse_invert_y") {
-        v.mouse_invert_y = i != 0;
-    } else if (key == "mouse_sensitivity") {
-        char* end = nullptr;
-        const float sensitivity = std::strtof(value.c_str(), &end);
-        v.mouse_sensitivity = end != value.c_str() && !*end && std::isfinite(sensitivity)
-                                  ? Clamp(sensitivity, 1.f, 400.f) : 100.f;
     } else if (key == "menu_pos") {
         float x = -1.0f, y = -1.0f;
         if (std::sscanf(value.c_str(), "%f,%f", &x, &y) == 2 && x >= 0.0f && x <= 1.0f && y >= 0.0f &&
@@ -105,13 +73,20 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.fsr4_invert_jitter = i != 0;
     } else if (key == "model_lod") {
         v.model_lod = std::clamp(i, -2, 2);
+    } else if (key == "frame_generation") {
+        v.frame_generation = i != 0;
     } else if (key == "live_resolution") {
         v.live_resolution = value == "auto" ? -1 : std::clamp(i, 0, 1);
     } else if (key == "output_res") {
-        for (int r = 0; r < OutputCount; ++r) {
-            if (value == std::to_string(OutputWidths[r]) + "x" + std::to_string(OutputHeights[r])) {
-                v.output_res = r;
-            }
+        int w = 0, h = 0;
+        if (std::sscanf(value.c_str(), "%dx%d", &w, &h) == 2 && w >= 320 && h >= 200 && w <= 16384 &&
+            h <= 16384) {
+            v.output_res = PackSize({w, h});
+        }
+    } else if (key == "aspect_ratio") {
+        v.aspect = AspectAuto;
+        for (int a = 0; a < AspectCount; ++a) {
+            if (value == AspectKey(a)) v.aspect = a;
         }
     } else {
         for (int e = 0; e < EffectCount; ++e) {
@@ -123,6 +98,115 @@ void Set(Values& v, const std::string& key, const std::string& value) {
 }
 
 } // namespace
+
+namespace {
+struct Group {
+    const char* key;
+    double ratio;
+    std::array<OutputSize, 10> sizes;
+    int count;
+};
+constexpr Group Groups[AspectCount] = {
+    {"auto", 0.0, {}, 0},
+    {"4:3", 4.0 / 3.0,
+     {{{640, 480}, {800, 600}, {1024, 768}, {1280, 960}, {1440, 1080}, {1600, 1200}, {2048, 1536}, {2880, 2160}}}, 8},
+    {"16:10", 16.0 / 10.0,
+     {{{640, 400}, {960, 600}, {1280, 800}, {1440, 900}, {1680, 1050}, {1920, 1200}, {2560, 1600}, {3840, 2400}}}, 8},
+    {"16:9", 16.0 / 9.0,
+     {{{640, 360}, {854, 480}, {960, 540}, {1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3200, 1800},
+       {3840, 2160}}}, 9},
+    // 2560x1080 and 5120x2160 are 64:27, 3440x1440 43:18, 3840x1600 12:5: each output's own
+    // ratio is the camera's.
+    {"21:9", 64.0 / 27.0,
+     {{{860, 360}, {1280, 540}, {1720, 720}, {2560, 1080}, {3440, 1440}, {3840, 1600}, {5120, 2160}}}, 7},
+    {"32:9", 32.0 / 9.0, {{{1280, 360}, {1920, 540}, {2560, 720}, {3840, 1080}, {5120, 1440}, {7680, 2160}}}, 6},
+};
+std::atomic<std::uint32_t> monitor{0}; // PackSize, 0 until known
+} // namespace
+
+int OutputList::IndexOf(OutputSize size) const {
+    for (int i = 0; i < count; ++i) {
+        if (sizes[i] == size) return i;
+    }
+    return -1;
+}
+
+const char* AspectKey(int aspect) {
+    return Groups[std::clamp(aspect, 0, AspectCount - 1)].key;
+}
+
+OutputSize Monitor() {
+    return UnpackSize(monitor.load(std::memory_order_relaxed));
+}
+
+int ResolvedAspect(int aspect) {
+    if (aspect > AspectAuto && aspect < AspectCount) return aspect;
+    const OutputSize m = Monitor();
+    if (m.width <= 0 || m.height <= 0) return Aspect16x9;
+    const double ratio = double(m.width) / m.height;
+    int best = Aspect16x9;
+    for (int a = AspectAuto + 1; a < AspectCount; ++a) {
+        if (std::abs(std::log(ratio / Groups[a].ratio)) < std::abs(std::log(ratio / Groups[best].ratio))) {
+            best = a;
+        }
+    }
+    return best;
+}
+
+OutputList Outputs(int aspect) {
+    const Group& g = Groups[ResolvedAspect(aspect)];
+    OutputList list;
+    for (int i = 0; i < g.count; ++i) list.sizes[list.count++] = g.sizes[i];
+    // Auto: the monitor's own size too (another ratio than its group's sizes, 1366x768, ...).
+    const OutputSize m = Monitor();
+    if (aspect == AspectAuto && m.width >= 640 && m.height >= 360 && m.width <= 7680 &&
+        m.height <= 4320 && list.IndexOf(m) < 0) {
+        int at = 0;
+        while (at < list.count && (list.sizes[at].height < m.height ||
+                                   (list.sizes[at].height == m.height && list.sizes[at].width < m.width))) {
+            ++at;
+        }
+        for (int i = list.count; i > at; --i) list.sizes[i] = list.sizes[i - 1];
+        list.sizes[at] = m;
+        ++list.count;
+    }
+    return list;
+}
+
+OutputSize NearestOutput(int aspect, OutputSize size) {
+    const OutputList list = Outputs(aspect);
+    if (list.IndexOf(size) >= 0) return size;
+    OutputSize best = list.sizes[0];
+    for (const OutputSize& s : list) {
+        if (std::abs(s.height - size.height) < std::abs(best.height - size.height)) best = s;
+    }
+    return best;
+}
+
+OutputSize CurrentOutput() {
+    const auto& v = Get();
+    return NearestOutput(v.aspect.load(std::memory_order_relaxed),
+                         UnpackSize(v.output_res.load(std::memory_order_relaxed)));
+}
+
+std::string SizeText(OutputSize size) {
+    return std::to_string(size.width) + "x" + std::to_string(size.height);
+}
+
+void SetMonitor(int width, int height) {
+    const OutputSize m{width, height};
+    if (width <= 0 || height <= 0 || m == Monitor()) return;
+    monitor.store(PackSize(m), std::memory_order_relaxed);
+    auto& v = Get();
+    // Auto follows the monitor: its output is kept (and saved: run.sh's startup patch reads it).
+    const OutputSize fitted = CurrentOutput();
+    if (v.aspect == AspectAuto && PackSize(fitted) != v.output_res.load()) {
+        std::printf("Output: %s for the monitor (%dx%d, aspect ratio auto)\n", SizeText(fitted).c_str(),
+                    width, height);
+        v.output_res = PackSize(fitted);
+        Save();
+    }
+}
 
 Values& Get() {
     static Values values;
@@ -175,21 +259,16 @@ void Load() {
             if (std::strcmp(env, UpscalerName(u)) == 0) v.upscaler = u;
         }
     }
-    const std::pair<const char *, const char *> env_keys[] = {
-        {"BB_FRAME_GENERATION", "frame_generation"},
-        {"BB_DLSS_PRESET", "dlss_preset"},
-        {"BB_FSR_SHARPNESS", "sharpness"},
-        {"BB_JITTER", "jitter"},
-        {"BB_REACTIVE", "reactive"},
-        {"BB_REACTIVE_SCALE", "reactive_scale"},
-        {"BB_REACTIVE_THRESHOLD", "reactive_threshold"},
-        {"BB_REACTIVE_MAX", "reactive_max"},
-        {"BB_UPSCALE_PRESET", "preset"},
-        {"BB_OBJECT_MOTION", "object_motion"},
-        {"BB_MOUSE_CAMERA", "mouse_camera"},
-        {"BB_MOUSE_SENSITIVITY", "mouse_sensitivity"},
-        {"BB_MOUSE_INVERT_Y", "mouse_invert_y"},
+    const std::pair<const char*, const char*> env_keys[] = {
+        {"BB_FSR_SHARPNESS", "sharpness"},        {"BB_JITTER", "jitter"},
+        {"BB_REACTIVE", "reactive"},              {"BB_REACTIVE_SCALE", "reactive_scale"},
+        {"BB_REACTIVE_THRESHOLD", "reactive_threshold"}, {"BB_REACTIVE_MAX", "reactive_max"},
+        {"BB_UPSCALE_PRESET", "preset"},            {"BB_OBJECT_MOTION", "object_motion"},
+        {"BB_FRAME_GEN", "frame_generation"},
     };
+    // Frame generation is hidden in the menu until its artifacts are fixed: only BB_FRAME_GEN turns
+    // it on, a saved setting does not.
+    v.frame_generation = false;
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env)) {
             Set(v, key, value);
@@ -202,7 +281,11 @@ void Load() {
         v.startup_effects[e] = v.effects[e];
     }
     v.startup_model_lod = v.model_lod;
-    v.startup_output_res = v.output_res;
+    if (FixedRenderSession()) {
+        int w = 0, h = 0;
+        const char* output = std::getenv("BB_OUTPUT_RES");
+        if (output && std::sscanf(output, "%dx%d", &w, &h) == 2) v.startup_output = {w, h};
+    }
     v.startup_live_resolution = v.live_resolution;
 }
 
@@ -228,7 +311,7 @@ void ConfigureDlssSupport(bool available, const char* problem) {
     v.dlss_problem = available || kept.empty() ? nullptr : kept.c_str();
     if (v.upscaler == UpscalerDlss && !available) {
         std::printf("Upscaler: DLSS unavailable (%s); falling back to FSR 3.1\n",
-                    kept.empty() ? "bbport_dlss.dll or nvngx_dlss.dll missing" : kept.c_str());
+                    kept.empty() ? "the DLSS bridge or NVIDIA's DLSS library is missing" : kept.c_str());
         v.upscaler = UpscalerFsr3;
     }
 }
@@ -248,14 +331,12 @@ bool ResolutionNeedsRestart() {
     const auto& v = Get();
     // TAA needs the live path (native guest targets): run.sh selects it on restart.
     return FixedRenderSession() &&
-        (v.preset != v.startup_preset || v.output_res != v.startup_output_res ||
+        (v.preset != v.startup_preset || CurrentOutput() != v.startup_output ||
          (v.upscaler == UpscalerOff) != (v.startup_upscaler == UpscalerOff) ||
          (v.upscaler == UpscalerTaa) != (v.startup_upscaler == UpscalerTaa));
 }
 
 void Save() {
-    static std::mutex save_mutex;
-    std::scoped_lock lock{save_mutex};
     const auto& v = Get();
     // The keys the menu writes, in this order; the rest of the file stays as it is: the
     // launcher's controls (key.* / pad.*) and its other keys, comments.
@@ -267,10 +348,11 @@ void Save() {
         return std::string(text);
     };
     const auto flag = [](bool value) { return std::string(value ? "1" : "0"); };
-    put("menu_language", v.menu_language == MenuLanguage::Russian ? "ru" : "en");
+    if (v.menu_language_chosen) {
+        put("menu_language", v.menu_language == MenuLanguage::Russian ? "ru" : "en");
+    }
     put("upscaler", UpscalerName(v.upscaler));
     put("preset", std::to_string(v.preset.load()));
-    put("dlss_preset", DlssPresetName(v.dlss_preset));
     put("sharpen", flag(v.sharpen));
     put("sharpness", fixed(v.sharpness, 2));
     put("jitter", flag(v.jitter));
@@ -281,12 +363,6 @@ void Save() {
     put("reactive_max", fixed(v.reactive_max, 2));
     put("debug_view", std::to_string(v.debug_view.load()));
     put("show_fps", flag(v.show_fps));
-    put("mouse_camera", flag(v.mouse_camera));
-    put("mouse_invert_y", flag(v.mouse_invert_y));
-    put("mouse_sensitivity", fixed(v.mouse_sensitivity, 2));
-    put("frame_generation", v.frame_generation == FrameGenerationFsr    ? "fsr"
-                            : v.frame_generation == FrameGenerationDlss ? "dlss"
-                                                                        : "off");
     put("fsr4_auto_exposure", flag(v.fsr4_auto_exposure));
     put("fsr4_invert_jitter", flag(v.fsr4_invert_jitter));
     // Read by patches.py at start.
@@ -294,10 +370,11 @@ void Save() {
         put(Effects[e].key, flag(v.effects[e]));
     }
     put("model_lod", std::to_string(v.model_lod.load()));
-    put("output_res", std::to_string(OutputWidths[v.output_res]) + "x" +
-                          std::to_string(OutputHeights[v.output_res]));
+    put("aspect_ratio", AspectKey(v.aspect));
+    put("output_res", SizeText(CurrentOutput()));
     // Read by run.sh at start.
     put("live_resolution", v.live_resolution < 0 ? "auto" : flag(v.live_resolution != 0));
+    put("frame_generation", flag(v.frame_generation));
     if (v.menu_x >= 0.0f && v.menu_y >= 0.0f) {
         put("menu_pos", fixed(v.menu_x, 4) + "," + fixed(v.menu_y, 4));
     }
@@ -338,15 +415,11 @@ void Save() {
     }
     // Replaced whole: a crash while writing leaves the old file.
     const std::string temporary = std::string(Path()) + ".tmp";
-    FILE* file = std::fopen(temporary.c_str(), "wb");
+    FILE* file = std::fopen(temporary.c_str(), "w");
     bool ok = file && std::fwrite(out.data(), 1, out.size(), file) == out.size();
     ok = file && std::fclose(file) == 0 && ok;
-    // filesystem::rename replaces an existing destination on Windows as well as POSIX.
-    std::error_code ec;
-    if (ok) std::filesystem::rename(temporary, Path(), ec);
-    if (!ok || ec) {
+    if (!ok || std::rename(temporary.c_str(), Path()) != 0) {
         std::printf("Settings: cannot write %s\n", Path());
-        std::filesystem::remove(temporary, ec);
     }
 }
 
@@ -364,30 +437,6 @@ const char* PresetName(int preset) {
 const char* UpscalerName(int upscaler) {
     static constexpr const char* names[UpscalerCount] = {"off", "fsr3", "fsr4", "fsr411", "taa", "dlss"};
     return names[std::clamp(upscaler, 0, UpscalerCount - 1)];
-}
-
-const char* DlssPresetName(int preset) {
-    static constexpr const char* names[] = {"auto", "A", "B", "C", "D", "E", "F", "J", "K", "M", "L"};
-    for (int i = 0; i < DlssPresetCount; ++i) {
-        if (preset == DlssPresets[i]) return names[i];
-    }
-    return "auto";
-}
-
-const char* DlssPresetLabel(int preset) {
-    switch (preset) {
-    case 1: return MenuText("A (legacy)", "A (устаревший)");
-    case 2: return MenuText("B (legacy)", "B (устаревший)");
-    case 3: return MenuText("C (legacy)", "C (устаревший)");
-    case 4: return MenuText("D (legacy)", "D (устаревший)");
-    case 5: return MenuText("E (CNN)", "E (свёрточная)");
-    case 6: return MenuText("F (CNN)", "F (свёрточная)");
-    case 10: return MenuText("J (Transformer)", "J (трансформер)");
-    case 11: return MenuText("K (Transformer)", "K (трансформер)");
-    case 13: return MenuText("M (Transformer 2)", "M (трансформер 2)");
-    case 12: return MenuText("L (Transformer 2)", "L (трансформер 2)");
-    default: return MenuText("Auto (DLL default)", "Авто (выбор DLL)");
-    }
 }
 
 } // namespace BbSettings

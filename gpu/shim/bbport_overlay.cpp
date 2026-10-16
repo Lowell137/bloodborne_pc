@@ -2,12 +2,13 @@
 #include "bbport_overlay.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
-#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -15,39 +16,36 @@
 
 #include <SDL3/SDL.h>
 #include "bbport_settings.h"
-#include "bbport_mouse.h"
-#include "../bbgpu.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
-#include "video_core/renderer_vulkan/vk_instance.h"
-#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "vulkan/instance.h"
+#include "render/scheduler.h"
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
 #ifdef _WIN32
-asm(".section .rdata,\"dr\"\n"
-    ".balign 16\n"
-    ".global bb_font_ttf\n"
-    "bb_font_ttf:\n"
-    ".incbin \"" BB_FONT_PATH "\"\n"
-    ".global bb_font_ttf_end\n"
-    "bb_font_ttf_end:\n"
-    ".text\n");
+#define BB_FONT_SECTION ".section .rdata,\"dr\"\n"
+#define BB_FONT_HIDDEN(name) ""
+#define BB_FONT_END ".text\n"
 #else
-asm(".section .rodata\n"
+#define BB_FONT_SECTION ".section .rodata\n"
+#define BB_FONT_HIDDEN(name) ".hidden " name "\n"
+#define BB_FONT_END ".previous\n"
+#endif
+asm(BB_FONT_SECTION
     ".balign 16\n"
-    ".hidden bb_font_ttf\n"
+    BB_FONT_HIDDEN("bb_font_ttf")
     ".global bb_font_ttf\n"
     "bb_font_ttf:\n"
     ".incbin \"" BB_FONT_PATH "\"\n"
-    ".hidden bb_font_ttf_end\n"
+    BB_FONT_HIDDEN("bb_font_ttf_end")
     ".global bb_font_ttf_end\n"
     "bb_font_ttf_end:\n"
-    ".previous\n");
-#endif
+    BB_FONT_END);
 extern "C" const unsigned char bb_font_ttf[];
 extern "C" const unsigned char bb_font_ttf_end[];
 
 extern "C" void runtime_restart(void); // bb-probe (probe.c)
+extern "C" __attribute__((weak)) void runtime_toypad_lights(uint32_t out[3]); // runtime_toypad.c
 
 namespace BbOverlay {
 
@@ -58,21 +56,21 @@ bool initialized = false;
 std::atomic<bool> menu_open{false};
 bool l3_down = false, r3_down = false;
 bool dirty = false; // settings changed while open: saved on close
-// The game's text dialog (SetTextEntry), guarded by imgui_mutex.
-bool text_entry_active = false;
-std::string text_entry_prompt, text_entry_text;
 float base_scale = 1.0f;
+// The game's text dialog (ImeDialog, the character name), typed on the keyboard: drawn while it
+// is open. In fullscreen the window title that showed it is not visible (issues #17, #19).
+std::mutex prompt_mutex;
+std::atomic<bool> prompt_active{false};
+/// A module's line over the game (bbgpu_overlay_banner: BBSC's "joining the host" during its
+/// loads, where the game itself shows a black screen).
+std::mutex banner_mutex;
+std::string banner_text;
+std::atomic<bool> banner_active{false};
+std::string prompt_title, prompt_text;
 
 // Present rate for the FPS counter.
 std::chrono::steady_clock::time_point last_present{};
 float frame_ms_avg = 0.0f;
-std::atomic<std::int64_t> mouse_toast_until{0};
-bool mouse_toast_enabled = false;
-
-std::int64_t NowMs() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-}
 
 float PixelDensity(SDL_WindowID id);
 
@@ -80,12 +78,6 @@ void SetOpen(bool value) {
     if (menu_open.exchange(value) == value) {
         return;
     }
-    // Releases may arrive while the menu is closed. Drop old presses/queued events so
-    // reopening the menu never inherits a held mouse button, modifier or gamepad key.
-    ImGuiIO& io = ImGui::GetIO();
-    io.ClearEventsQueue();
-    io.ClearInputKeys();
-    io.ClearInputMouse();
     // The system cursor shows over the menu (window.cpp); ImGui learns where it is now, not at
     // the next motion: mouse motion is not passed on while the menu is closed.
     if (value) {
@@ -103,12 +95,6 @@ void SetOpen(bool value) {
 }
 
 ImGuiKey KeyFromSdl(SDL_Keycode key) {
-    if (key >= SDLK_A && key <= SDLK_Z) {
-        return ImGuiKey(ImGuiKey_A + key - SDLK_A);
-    }
-    if (key >= SDLK_0 && key <= SDLK_9) {
-        return ImGuiKey(ImGuiKey_0 + key - SDLK_0);
-    }
     switch (key) {
     case SDLK_TAB: return ImGuiKey_Tab;
     case SDLK_LEFT: return ImGuiKey_LeftArrow;
@@ -170,16 +156,12 @@ void Store(std::atomic<T>& target, T value, bool changed) {
 
 void Checkbox(const char* label, std::atomic<bool>& value) {
     bool v = value;
-    // Evaluate the widget first: argument evaluation order could otherwise read v
-    // before ImGui edits it, storing the old value again (Clang on Windows does).
-    const bool changed = ImGui::Checkbox(label, &v);
-    Store(value, v, changed);
+    Store(value, v, ImGui::Checkbox(label, &v));
 }
 
 void Slider(const char* label, std::atomic<float>& value, float lo, float hi) {
     float v = value;
-    const bool changed = ImGui::SliderFloat(label, &v, lo, hi, "%.2f");
-    Store(value, v, changed);
+    Store(value, v, ImGui::SliderFloat(label, &v, lo, hi, "%.2f"));
 }
 
 void Hint(const char* text) {
@@ -193,31 +175,204 @@ void Hint(const char* text) {
     }
 }
 
+// The USB toy pad: the figures on the emulated pad, put on and lifted off from
+// the menu with the gamepad. The runtime names the figures file (BB_TOYPAD_FILE) once the game
+// opens the pad and reads it again when it changes; this section edits that file.
+struct ToyPadFigure {
+    int zone;
+    unsigned id;
+};
+struct ToyPadName {
+    unsigned id;
+    std::string name;
+};
+
+std::vector<ToyPadFigure> ReadToyPad(const char* path) {
+    std::vector<ToyPadFigure> figures;
+    FILE* file = std::fopen(path, "r");
+    char line[256];
+    while (file && std::fgets(line, sizeof(line), file)) {
+        if (char* hash = std::strchr(line, '#')) {
+            *hash = 0;
+        }
+        int zone;
+        unsigned id;
+        if (std::sscanf(line, "%d %u", &zone, &id) == 2 && zone >= 1 && zone <= 3 && id) {
+            figures.push_back({zone, id});
+        }
+    }
+    if (file) {
+        std::fclose(file);
+    }
+    return figures;
+}
+
+// Figure names: "<id> <name>" lines in figure_ids.txt next to the figures file (BB_TOYPAD_NAMES
+// names another one); without it the ids are shown.
+const std::vector<ToyPadName>& ToyPadNames(const char* figures_path) {
+    static std::vector<ToyPadName> names;
+    static bool loaded;
+    if (!loaded) {
+        loaded = true;
+        std::string path;
+        if (const char* env = std::getenv("BB_TOYPAD_NAMES"); env && *env) {
+            path = env;
+        } else {
+            path = figures_path;
+            const size_t slash = path.rfind('/');
+            path = (slash == std::string::npos ? std::string{} : path.substr(0, slash + 1)) + "figure_ids.txt";
+        }
+        FILE* file = std::fopen(path.c_str(), "r");
+        char line[256];
+        while (file && std::fgets(line, sizeof(line), file)) {
+            unsigned id;
+            int used = 0;
+            if (std::sscanf(line, "%u %n", &id, &used) == 1 && id) {
+                std::string name = line + used;
+                while (!name.empty() && (name.back() == '\n' || name.back() == '\r' || name.back() == ' ')) {
+                    name.pop_back();
+                }
+                names.push_back({id, name});
+            }
+        }
+        if (file) {
+            std::fclose(file);
+        }
+    }
+    return names;
+}
+
+std::string ToyPadLabel(const std::vector<ToyPadName>& names, unsigned id) {
+    for (const auto& n : names) {
+        if (n.id == id) {
+            return n.name + " (" + std::to_string(id) + ")";
+        }
+    }
+    return "#" + std::to_string(id);
+}
+
+void WriteToyPad(const char* path, const std::vector<ToyPadFigure>& figures,
+                 const std::vector<ToyPadName>& names) {
+    const std::string temp = std::string{path} + ".tmp";
+    FILE* file = std::fopen(temp.c_str(), "w");
+    if (!file) {
+        return;
+    }
+    std::fputs("# Figures on the virtual Toy Pad: \"<zone> <figure id>\", one per line.\n"
+               "# Zone 1: centre (1 figure), 2: left (3), 3: right (3). Also edited from the menu "
+               "(Insert / L3+R3).\n", file);
+    for (const auto& f : figures) {
+        std::fprintf(file, "%d %u  # %s\n", f.zone, f.id, ToyPadLabel(names, f.id).c_str());
+    }
+    std::fclose(file);
+    std::rename(temp.c_str(), path);
+}
+
+void ToyPadSection() {
+    const char* path = std::getenv("BB_TOYPAD_FILE");
+    if (!path || !*path) {
+        return;
+    }
+    const auto& names = ToyPadNames(path);
+    auto figures = ReadToyPad(path);
+    bool changed = false;
+    u32 lights[3] = {};
+    if (runtime_toypad_lights) {
+        runtime_toypad_lights(lights);
+    }
+    static unsigned pick_id = 1; // the figure to put on
+    ImGui::SeparatorText(BbSettings::MenuText("Toy Pad", "Toy Pad (фигурки)"));
+    // Choosing a figure: characters, then vehicles and gadgets (ids from 1000).
+    const std::string current = ToyPadLabel(names, pick_id);
+    if (ImGui::BeginCombo(BbSettings::MenuText("Figure", "Фигурка"), current.c_str(),
+                          ImGuiComboFlags_HeightLarge)) {
+        for (int vehicles = 0; vehicles < 2; ++vehicles) {
+            ImGui::SeparatorText(vehicles ? BbSettings::MenuText("Vehicles and gadgets", "Техника")
+                                          : BbSettings::MenuText("Characters", "Персонажи"));
+            for (const auto& n : names) {
+                if ((n.id >= 1000) != bool(vehicles)) {
+                    continue;
+                }
+                const std::string label = ToyPadLabel(names, n.id);
+                if (ImGui::Selectable(label.c_str(), n.id == pick_id)) {
+                    pick_id = n.id;
+                }
+                if (n.id == pick_id && ImGui::IsWindowAppearing()) {
+                    ImGui::SetScrollHereY();
+                }
+            }
+        }
+        ImGui::EndCombo();
+    }
+    // The zones in the pad's order (left, centre, right), each lit as the game lights it: the
+    // zone it wants a figure on glows.
+    static const int order[] = {2, 1, 3};
+    static const char* zone_en[] = {"Centre", "Left", "Right"};
+    static const char* zone_ru[] = {"Центр", "Левая", "Правая"};
+    for (const int zone : order) {
+        ImGui::PushID(zone);
+        const u32 c = lights[zone - 1];
+        const ImVec4 colour = c ? ImVec4(((c >> 16) & 255) / 255.0f, ((c >> 8) & 255) / 255.0f,
+                                         (c & 255) / 255.0f, 1.0f)
+                                : ImVec4(0.35f, 0.35f, 0.35f, 1.0f);
+        ImGui::TextColored(colour, "%s", c ? "●" : "○");
+        ImGui::SameLine();
+        ImGui::TextUnformatted(BbSettings::MenuText(zone_en[zone - 1], zone_ru[zone - 1]));
+        int count = 0;
+        for (size_t i = 0; i < figures.size(); ++i) {
+            if (figures[i].zone != zone) {
+                continue;
+            }
+            ++count;
+            ImGui::PushID(int(i));
+            ImGui::SameLine();
+            const std::string label = ToyPadLabel(names, figures[i].id) + "  ×";
+            if (ImGui::SmallButton(label.c_str())) {
+                figures.erase(figures.begin() + long(i));
+                changed = true;
+                ImGui::PopID();
+                break;
+            }
+            ImGui::PopID();
+        }
+        const bool full = count >= (zone == 1 ? 1 : 3) || figures.size() >= 7;
+        if (!full) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton(BbSettings::MenuText("+ put here", "+ поставить сюда"))) {
+                figures.push_back({zone, pick_id});
+                changed = true;
+            }
+        }
+        ImGui::PopID();
+    }
+    Hint(BbSettings::MenuText(
+        "Choose a figure, then \"+ put here\" on a zone; press a figure to lift it. The dot is the "
+        "zone's light: when the game asks for a figure it lights the zone to put it on. If the "
+        "game misses a figure, lift it and put it on again.",
+        "Выберите фигурку и нажмите «+ поставить сюда» у зоны; нажатие на фигурку снимает её. "
+        "Кружок — подсветка зоны: когда игра просит фигурку, она подсвечивает зону, куда её "
+        "ставить. Если игра не заметила фигурку — снимите и поставьте снова."));
+    if (changed) {
+        WriteToyPad(path, figures, names);
+    }
+}
+
 // The settings menu as in 0.3 and 0.4: one window (moved with the mouse, its place kept in
 // bbport.ini), sections one under the other, ImGui's own widgets and keyboard/gamepad navigation.
 void Menu() {
     auto& s = BbSettings::Get();
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    const float pad = 12.0f * base_scale;
-    const ImVec2 limit(std::max(viewport->WorkSize.x - 2 * pad, 1.0f),
-                       std::max(viewport->WorkSize.y - 2 * pad, 1.0f));
-    const ImVec2 size(std::min(620.0f * base_scale, limit.x),
-                      std::min(820.0f * base_scale, limit.y));
     // Where it was moved last (bbport.ini menu_pos, a fraction of the screen), kept on screen.
     ImVec2 pos(viewport->WorkPos.x + 40.0f * base_scale, viewport->WorkPos.y + 40.0f * base_scale);
     if (s.menu_x >= 0.0f && s.menu_y >= 0.0f) {
-        pos.x = viewport->WorkPos.x + s.menu_x * viewport->WorkSize.x;
-        pos.y = viewport->WorkPos.y + s.menu_y * viewport->WorkSize.y;
+        const float margin = 80.0f * base_scale;
+        pos.x = viewport->WorkPos.x +
+                std::clamp(s.menu_x * viewport->WorkSize.x, 0.0f, std::max(viewport->WorkSize.x - margin, 0.0f));
+        pos.y = viewport->WorkPos.y +
+                std::clamp(s.menu_y * viewport->WorkSize.y, 0.0f, std::max(viewport->WorkSize.y - margin, 0.0f));
     }
-    pos.x = std::clamp(pos.x, viewport->WorkPos.x + pad,
-                       viewport->WorkPos.x + pad + limit.x - size.x);
-    pos.y = std::clamp(pos.y, viewport->WorkPos.y + pad,
-                       viewport->WorkPos.y + pad + limit.y - size.y);
     ImGui::SetNextWindowPos(pos, ImGuiCond_Appearing);
-    ImGui::SetNextWindowSize(size, ImGuiCond_Appearing);
-    ImGui::SetNextWindowSizeConstraints(
-        ImVec2(std::min(360.0f * base_scale, limit.x), std::min(240.0f * base_scale, limit.y)),
-        limit);
+    ImGui::SetNextWindowSize(ImVec2(620.0f * base_scale, 0.0f), ImGuiCond_Appearing);
     bool keep_open = true;
     if (!ImGui::Begin(
             BbSettings::MenuText("Bloodborne - Graphics  (Insert / L3+R3)###bbport_settings",
@@ -226,15 +381,6 @@ void Menu() {
         ImGui::End();
         return;
     }
-    ImGui::TextDisabled("bbport %s", bbgpu_version());
-    // Resizing the game window or dragging the menu must leave every control reachable.
-    const ImVec2 at = ImGui::GetWindowPos(), actual_size = ImGui::GetWindowSize();
-    const ImVec2 bounded(
-        std::clamp(at.x, viewport->WorkPos.x + pad,
-                   viewport->WorkPos.x + pad + std::max(limit.x - actual_size.x, 0.0f)),
-        std::clamp(at.y, viewport->WorkPos.y + pad,
-                   viewport->WorkPos.y + pad + std::max(limit.y - actual_size.y, 0.0f)));
-    ImGui::SetWindowPos(bounded);
     // Moved: remembered (saved with the settings when the menu closes).
     if (!ImGui::IsWindowAppearing() && viewport->WorkSize.x > 0.0f && viewport->WorkSize.y > 0.0f) {
         const ImVec2 at = ImGui::GetWindowPos();
@@ -252,25 +398,27 @@ void Menu() {
     if (ImGui::Combo("Language", &language, languages, 2)) {
         s.menu_language =
             language == 1 ? BbSettings::MenuLanguage::Russian : BbSettings::MenuLanguage::English;
+        s.menu_language_chosen = true;
         BbSettings::Save();
     }
     ImGui::Text(BbSettings::MenuText("%.0f FPS  (%.1f ms)", "%.0f FPS  (%.1f мс)"),
                 frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f, frame_ms_avg);
-    if (s.frame_generation_active && s.frame_generation_render_ms > 0)
-        ImGui::Text(BbSettings::MenuText("FG 2x | Render: %.0f FPS", "FG 2x | Рендер: %.0f FPS"),
-                    1000.f / s.frame_generation_render_ms.load());
+    ToyPadSection();
 
     ImGui::SeparatorText(BbSettings::MenuText("Temporal upscaler", "Временной апскейлер"));
     const char* upscalers[] = {
-        BbSettings::MenuText("Off", "Выкл"), "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1 (INT8)",
-        BbSettings::MenuText("TAA (native anti-aliasing)", "TAA (родное сглаживание)"), "DLSS (NVIDIA RTX)"};
+        BbSettings::MenuText("Off", "Выкл"), "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1",
+        BbSettings::MenuText("TAA (native anti-aliasing)", "TAA (нативное сглаживание)"),
+        "DLSS (NVIDIA RTX)"};
+    static_assert(sizeof(upscalers) / sizeof(upscalers[0]) == BbSettings::UpscalerCount);
     static const char* later[] = {"XeSS"};
     int upscaler = s.upscaler;
     if (ImGui::BeginCombo(BbSettings::MenuText("Upscaler", "Апскейлер"), upscalers[upscaler])) {
         for (int i = 0; i < BbSettings::UpscalerCount; ++i) {
-            const bool supported = i == BbSettings::UpscalerFsr4 ? s.fsr4_supported.load()
-                : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load()
-                : i == BbSettings::UpscalerDlss   ? s.dlss_supported.load() : true;
+            const bool supported = i == BbSettings::UpscalerFsr4     ? s.fsr4_supported.load()
+                                   : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load()
+                                   : i == BbSettings::UpscalerDlss   ? s.dlss_supported.load()
+                                                                     : true;
             ImGui::BeginDisabled(!supported);
             if (ImGui::Selectable(upscalers[i], i == upscaler)) {
                 Store(s.upscaler, i, true);
@@ -348,47 +496,7 @@ void Menu() {
             "Проверка при гостинге: сеть FSR 4 нормирует цвет по экспозиции и по ней решает, "
             "когда отбросить прошлые кадры. Меняются сразу, без перезапуска."));
     }
-    if (s.upscaler == BbSettings::UpscalerDlss) {
-        const int selected = s.dlss_preset;
-        if (ImGui::BeginCombo(BbSettings::MenuText("DLSS model preset", "Пресет модели DLSS"),
-                              BbSettings::DlssPresetLabel(selected))) {
-            for (int preset : BbSettings::DlssPresets) {
-                if (ImGui::Selectable(BbSettings::DlssPresetLabel(preset), preset == selected))
-                    Store(s.dlss_preset, preset, true);
-            }
-            ImGui::EndCombo();
-        }
-        Hint(BbSettings::MenuText(
-            "E/F: CNN. J/K: Transformer. M/L: Transformer 2. The DLL selects the model from "
-            "the preset. A-D were removed from current SDKs and may be substituted by the DLL; "
-            "E/F are deprecated. Changes apply immediately with a history reset.",
-            "E/F: свёрточная. J/K: трансформер. M/L: трансформер 2. DLL выбирает модель по "
-            "пресету. A-D удалены из актуальных SDK и могут заменяться самой DLL; E/F устарели. "
-            "Изменения применяются сразу со сбросом истории."));
-    }
     const bool upscaler_on = s.upscaler != BbSettings::UpscalerOff;
-    static const char *fg_names[] = {"Off", "FSR 3.1.6 x2", "DLSS Frame Generation x2"};
-    int fg = s.frame_generation;
-    if (ImGui::BeginCombo(BbSettings::MenuText("Frame generation", "Генерация кадров"),
-                          fg_names[fg])) {
-        for (int i = 0; i < BbSettings::FrameGenerationCount; ++i) {
-            const bool available = i == 0 || (upscaler_on && (i == BbSettings::FrameGenerationFsr
-                                                                  ? s.fsr_fg_supported.load()
-                                                                  : s.dlss_fg_supported.load()));
-            ImGui::BeginDisabled(!available);
-            if (ImGui::Selectable(fg_names[i], i == fg))
-                Store(s.frame_generation, i, true);
-            ImGui::EndDisabled();
-        }
-        ImGui::EndCombo();
-    }
-    if (const auto *problem = s.frame_generation_problem.load())
-        ImGui::TextWrapped("%s", problem);
-    if (s.frame_generation != BbSettings::FrameGenerationOff)
-        Hint(BbSettings::MenuText("SDR gameplay only. Frame generation adds display frames; "
-                                  "simulation/input rate stays unchanged.",
-                                  "Только игра в SDR. Добавляет кадры вывода; частота симуляции и "
-                                  "ввода остаётся прежней."));
     const bool taa = s.upscaler == BbSettings::UpscalerTaa;
     ImGui::BeginDisabled(!upscaler_on);
     ImGui::BeginDisabled(taa);
@@ -400,13 +508,12 @@ void Menu() {
         for (int i = 0; i < BbSettings::PresetCount; ++i) {
             char label[64];
             const float scale = BbSettings::PresetScale(i);
-            const int output = s.output_res;
+            const auto output = BbSettings::CurrentOutput();
             std::snprintf(
                 label, sizeof(label),
                 BbSettings::MenuText("%s (x%.1f, render %dx%d)", "%s (x%.1f, рендер %dx%d)"),
-                BbSettings::PresetName(i), scale,
-                int(std::lround(BbSettings::OutputWidths[output] / scale / 2) * 2),
-                int(std::lround(BbSettings::OutputHeights[output] / scale / 2) * 2));
+                BbSettings::PresetName(i), scale, int(std::lround(output.width / scale / 2) * 2),
+                int(std::lround(output.height / scale / 2) * 2));
             if (ImGui::Selectable(label, i == preset)) {
                 Store(s.preset, i, true);
             }
@@ -458,15 +565,29 @@ void Menu() {
     Checkbox(BbSettings::MenuText("Sharpening (RCAS)", "Резкость (RCAS)"), s.sharpen);
     ImGui::BeginDisabled(!s.sharpen);
     Slider(BbSettings::MenuText("Sharpness", "Сила резкости"), s.sharpness, 0.0f, 2.0f);
-    Hint(s.upscaler == BbSettings::UpscalerDlss ? BbSettings::MenuText(
-        "RCAS sharpening is applied after DLSS. Ctrl+click the slider to enter an exact value.",
-        "Резкость RCAS применяется после DLSS. Ctrl+клик по ползунку — ввести точное значение.")
-        : BbSettings::MenuText(
+    Hint(BbSettings::MenuText(
         "Up to 1: the upscaler's own sharpening (RCAS). Above 1 adds another RCAS pass. "
         "Ctrl+click the slider to enter an exact value.",
         "До 1 — резкость самого апскейлера (RCAS). Выше 1 добавляется ещё один проход RCAS. "
         "Ctrl+клик по ползунку — ввести точное значение."));
     ImGui::EndDisabled();
+    // Frame generation: hidden until its artifacts are fixed (BB_FRAME_GEN=1 for tests).
+    if (std::getenv("BB_FRAME_GEN")) {
+        ImGui::BeginDisabled(!s.frame_generation_supported.load(std::memory_order_relaxed));
+        Checkbox(BbSettings::MenuText("Frame generation (FSR 3)", "Генерация кадров (FSR 3)"),
+                 s.frame_generation);
+        ImGui::EndDisabled();
+        if (const char* problem = s.frame_generation_problem.load(std::memory_order_relaxed)) {
+            Hint(problem);
+        } else {
+            Hint(BbSettings::MenuText(
+                "Shows a frame interpolated by FSR 3 between each two of the game's: twice the frames "
+                "on screen, a little more input lag. Works with every upscaler preset except Off.",
+                "Между каждыми двумя кадрами игры показывается кадр, интерполированный FSR 3: на "
+                "экране вдвое больше кадров, задержка ввода чуть выше. Работает со всеми пресетами "
+                "апскейлера, кроме «Выкл»."));
+        }
+    }
     Checkbox(BbSettings::MenuText("Subpixel jitter", "Субпиксельный сдвиг (jitter)"), s.jitter);
     Hint(BbSettings::MenuText(
         "Each frame shifts the scene by a fraction of a pixel, letting the upscaler reconstruct "
@@ -475,13 +596,7 @@ void Menu() {
         "кадров больше деталей. Без него получается только сглаживание по истории."));
 
     ImGui::SeparatorText(BbSettings::MenuText("Reactive mask", "Маска реактивности"));
-    const bool dlss = s.upscaler == BbSettings::UpscalerDlss;
-    if (dlss) {
-        ImGui::TextWrapped("%s", BbSettings::MenuText(
-            "DLSS does not use this reactive mask. These controls apply to FSR.",
-            "DLSS не использует эту маску реактивности. Эти настройки применяются к FSR."));
-    }
-    ImGui::BeginDisabled(taa || dlss);
+    ImGui::BeginDisabled(taa);
     Checkbox(BbSettings::MenuText("Enable mask", "Включить маску"), s.reactive);
     Hint(BbSettings::IsFsr4(s.upscaler)
              ? BbSettings::MenuText(
@@ -535,14 +650,33 @@ void Menu() {
         "неподвижным, отсюда шлейф."));
     ImGui::EndDisabled(); // upscaler off
 
-    ImGui::SeparatorText(BbSettings::MenuText("Output resolution", "Разрешение вывода"));
-    static const char* outputs[] = {"1280 x 720", "1920 x 1080", "2560 x 1440", "3840 x 2160"};
-    int output = s.output_res;
-    if (ImGui::BeginCombo(BbSettings::MenuText("Output resolution", "Разрешение вывода"),
-                          outputs[output])) {
-        for (int i = 0; i < BbSettings::OutputCount; ++i) {
-            if (ImGui::Selectable(outputs[i], i == output)) {
-                Store(s.output_res, i, true);
+    ImGui::SeparatorText(BbSettings::MenuText("Output", "Вывод"));
+    // The aspect ratio first; its resolutions follow (another one keeps the height).
+    const auto aspect_label = [](int a) {
+        if (a != BbSettings::AspectAuto) return std::string(BbSettings::AspectKey(a));
+        return std::string(BbSettings::MenuText("Auto", "Авто")) + " (" +
+               BbSettings::AspectKey(BbSettings::ResolvedAspect(a)) + ")";
+    };
+    const int aspect = s.aspect;
+    if (ImGui::BeginCombo(BbSettings::MenuText("Aspect ratio", "Соотношение сторон"),
+                          aspect_label(aspect).c_str())) {
+        for (int a = 0; a < BbSettings::AspectCount; ++a) {
+            if (ImGui::Selectable(aspect_label(a).c_str(), a == aspect)) {
+                Store(s.output_res, BbSettings::PackSize(BbSettings::NearestOutput(a, BbSettings::CurrentOutput())),
+                      true);
+                Store(s.aspect, a, true);
+            }
+        }
+        ImGui::EndCombo();
+    }
+    const auto size_label = [](BbSettings::OutputSize o) {
+        return std::to_string(o.width) + " x " + std::to_string(o.height);
+    };
+    const auto current = BbSettings::CurrentOutput();
+    if (ImGui::BeginCombo(BbSettings::MenuText("Resolution", "Разрешение"), size_label(current).c_str())) {
+        for (const auto& o : BbSettings::Outputs(s.aspect)) {
+            if (ImGui::Selectable(size_label(o).c_str(), o == current)) {
+                Store(s.output_res, BbSettings::PackSize(o), true);
             }
         }
         ImGui::EndCombo();
@@ -550,16 +684,20 @@ void Menu() {
     if (BbSettings::FixedRenderSession()) {
         Hint(BbSettings::MenuText(
             "Size of the final frame and UI. The preset sets the scene size relative to "
-            "the output: 4K Performance = 1920x1080. Applies after restarting the game.",
+            "the output: 4K Performance = 1920x1080. Another aspect ratio widens the view (the "
+            "UI keeps to the screen edges). Applies after restarting the game.",
             "Размер готового кадра и интерфейса. Пресет задаёт размер сцены относительно "
-            "вывода: 4K Performance = 1920x1080. Применяется после перезапуска игры."));
+            "вывода: 4K Performance = 1920x1080. Другое соотношение сторон расширяет обзор "
+            "(интерфейс у краёв экрана). Применяется после перезапуска игры."));
     } else {
         Hint(BbSettings::MenuText(
             "The final frame and UI size changes at the next frame boundary. "
             "The preset sets the scene size relative to the output: 4K Performance = 1920x1080. "
+            "Another aspect ratio widens the view (the UI keeps to the screen edges). "
             "Changing the size resets the upscaler's history and may cause a brief pause.",
             "Размер готового кадра и интерфейса меняется на границе следующего кадра. "
             "Пресет задаёт размер сцены относительно вывода: 4K Performance = 1920x1080. "
+            "Другое соотношение сторон расширяет обзор (интерфейс у краёв экрана). "
             "Смена размера сбрасывает историю апскейлера и может вызвать короткую паузу."));
     }
     const char* live_modes[] = {BbSettings::MenuText("Auto (based on GPU)", "Авто (по видеокарте)"),
@@ -643,20 +781,6 @@ void Menu() {
     }
 
     ImGui::SeparatorText(BbSettings::MenuText("Other", "Прочее"));
-    ImGui::BeginDisabled(!BbMouse::Available());
-    Checkbox(BbSettings::MenuText("Mouse camera (F4)", "Камера мышью (F4)"), s.mouse_camera);
-    Slider(BbSettings::MenuText("Mouse sensitivity (%)", "Чувствительность мыши (%)"),
-           s.mouse_sensitivity, 1.f, 400.f);
-    Checkbox(BbSettings::MenuText("Invert mouse Y", "Инверсия мыши по Y"), s.mouse_invert_y);
-    ImGui::EndDisabled();
-    if (const auto* reason = BbMouse::Problem()) ImGui::TextWrapped("%s", reason);
-    Hint(BbSettings::MenuText(
-        "Raw mouse motion controls the camera directly, without stick acceleration. "
-        "F4 toggles capture. Opening this menu or switching windows releases the cursor. "
-        "Sensitivity is independent of the frame cap. Lock-on keeps the game's camera.",
-        "Мышь управляет камерой напрямую, без ускорения стика. F4 переключает захват. "
-        "Меню и переключение окон освобождают курсор. Чувствительность не зависит от "
-        "ограничителя FPS. При захвате цели работает камера игры."));
     Checkbox(BbSettings::MenuText("FPS counter in corner", "Счётчик FPS в углу"), s.show_fps);
 
     ImGui::Spacing();
@@ -687,30 +811,6 @@ void Menu() {
     }
 }
 
-// The game's text dialog: what is typed, and how to finish (keyboard or controller).
-void TextEntryBox() {
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
-                                   viewport->WorkPos.y + viewport->WorkSize.y * 0.42f),
-                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSizeConstraints(ImVec2(viewport->WorkSize.x * 0.32f, 0.0f),
-                                        ImVec2(viewport->WorkSize.x * 0.8f, FLT_MAX));
-    ImGui::SetNextWindowBgAlpha(0.92f);
-    ImGui::Begin("##text_entry", nullptr,
-                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
-                     ImGuiWindowFlags_NoFocusOnAppearing);
-    ImGui::TextColored(ImVec4(0.85f, 0.72f, 0.45f, 1.0f), "%s", text_entry_prompt.c_str());
-    ImGui::Separator();
-    ImGui::SetWindowFontScale(1.4f);
-    ImGui::Text("%s_", text_entry_text.c_str());
-    ImGui::SetWindowFontScale(1.0f);
-    ImGui::Separator();
-    ImGui::TextDisabled("Keyboard: type, Backspace to erase, Enter = OK, Esc = cancel");
-    ImGui::TextDisabled("Controller: Cross (A) = OK, Circle (B) = cancel");
-    ImGui::End();
-}
-
 void FpsCounter() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float pad = 12.0f * base_scale;
@@ -728,41 +828,33 @@ void FpsCounter() {
                 s.upscaler == BbSettings::UpscalerFsr3     ? "FSR 3.1"
                 : s.upscaler == BbSettings::UpscalerFsr4   ? "FSR 4"
                 : s.upscaler == BbSettings::UpscalerFsr411 ? "FSR 4.1.1"
-                : s.upscaler == BbSettings::UpscalerTaa ? "TAA"
-                : s.upscaler == BbSettings::UpscalerDlss ? "DLSS"
-                                                         : "");
-    if (s.frame_generation_active && s.frame_generation_render_ms > 0)
-        ImGui::Text(BbSettings::MenuText("FG 2x | Render: %.0f FPS", "FG 2x | Рендер: %.0f FPS"),
-                    1000.f / s.frame_generation_render_ms.load());
+                : s.upscaler == BbSettings::UpscalerTaa    ? "TAA"
+                : s.upscaler == BbSettings::UpscalerDlss   ? "DLSS"
+                                                           : "");
     ImGui::End();
 }
 
-void MouseCameraToast() {
-    const auto* viewport = ImGui::GetMainViewport();
-    const float margin = std::min(24.f * base_scale, viewport->WorkSize.x * .05f);
-    const float width = std::max(1.f, std::min(560.f * base_scale,
-                                             viewport->WorkSize.x - 2.f * margin));
-    const char* text = BbMouse::Problem();
-    if (!text) text = mouse_toast_enabled
-        ? BbSettings::MenuText("Mouse camera enabled (F4)", "Камера мышью включена (F4)")
-        : BbSettings::MenuText("Mouse camera disabled (F4)", "Камера мышью выключена (F4)");
-    const auto padding = ImGui::GetStyle().WindowPadding;
-    const float text_height = ImGui::CalcTextSize(text, nullptr, false,
-        std::max(1.f, width - 2.f * padding.x)).y;
-    const float height = std::max(1.f, std::min(text_height + 2.f * padding.y,
-                                              viewport->WorkSize.y - 2.f * margin));
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * .5f,
-                                  viewport->WorkPos.y + viewport->WorkSize.y - margin),
-                            ImGuiCond_Always, ImVec2(.5f, 1.f));
-    // Wrapped text needs a width on its very first frame. Auto-fitting both axes
-    // makes ImGui wrap to the minimum width and grow into a vertical column.
-    ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(.85f);
-    ImGui::Begin("##mouse_camera_toast", nullptr,
-                 ImGuiWindowFlags_NoDecoration |
-                 ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
-                 ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
-    ImGui::TextWrapped("%s", text);
+void TextPrompt() {
+    std::string title, text;
+    {
+        std::scoped_lock lock{prompt_mutex};
+        title = prompt_title;
+        text = prompt_text;
+    }
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+                                   viewport->WorkPos.y + viewport->WorkSize.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowBgAlpha(0.9f);
+    ImGui::Begin("##textprompt", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::TextUnformatted(title.c_str());
+    ImGui::Separator();
+    ImGui::Text("%s_", text.c_str());
+    ImGui::Separator();
+    ImGui::TextUnformatted("Keyboard: type, Backspace = delete, Enter = OK, Esc = cancel");
     ImGui::End();
 }
 
@@ -821,6 +913,14 @@ void ScriptedKeys() {
 
 } // namespace
 
+void SetTextPrompt(bool active, const std::string& prompt, const std::string& text) {
+    {
+        std::scoped_lock lock{prompt_mutex};
+        prompt_title = prompt;
+        prompt_text = text;
+    }
+    prompt_active = active;
+}
 
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) {
     std::scoped_lock lock{imgui_mutex};
@@ -908,9 +1008,8 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
         const bool down = event.type == SDL_EVENT_KEY_DOWN;
-        const bool close_on_escape = is_open && event.key.key == SDLK_ESCAPE &&
-            !io.WantTextInput && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup);
-        if (down && !event.key.repeat && (event.key.key == SDLK_INSERT || close_on_escape)) {
+        if (down && !event.key.repeat &&
+            (event.key.key == SDLK_INSERT || (is_open && event.key.key == SDLK_ESCAPE))) {
             SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);
             return true;
         }
@@ -973,8 +1072,6 @@ bool HandleEvent(const SDL_Event& event) {
                            : event.button.button == SDL_BUTTON_MIDDLE ? 2
                                                                       : -1;
         if (button >= 0) {
-            const float density = PixelDensity(event.button.windowID);
-            io.AddMousePosEvent(event.button.x * density, event.button.y * density);
             io.AddMouseButtonEvent(button, event.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
         }
         return true;
@@ -983,45 +1080,33 @@ bool HandleEvent(const SDL_Event& event) {
         if (!is_open) {
             return false;
         }
-        io.AddMouseWheelEvent(event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event.wheel.x
-                                                                            : event.wheel.x,
-                             event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event.wheel.y
-                                                                            : event.wheel.y);
+        io.AddMouseWheelEvent(event.wheel.x, event.wheel.y);
         return true;
-    case SDL_EVENT_WINDOW_FOCUS_GAINED:
-    case SDL_EVENT_WINDOW_FOCUS_LOST:
-        io.AddFocusEvent(event.type == SDL_EVENT_WINDOW_FOCUS_GAINED);
-        if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
-            l3_down = r3_down = false;
-        }
-        return false; // window lifecycle events still belong to the window
     default:
         return false;
     }
 }
 
-bool Visible() {
-    return initialized && (menu_open || text_entry_active || BbSettings::Get().show_fps ||
-                           mouse_toast_until.load(std::memory_order_relaxed) > NowMs());
+void SetBanner(const char* text) {
+    {
+        std::scoped_lock lock{banner_mutex};
+        banner_text = text ? text : "";
+    }
+    banner_active = text != nullptr && text[0] != 0;
 }
 
-bool MenuOpen() { return menu_open; }
+bool Visible() {
+    return initialized && (menu_open || prompt_active || banner_active ||
+                           BbSettings::Get().show_fps);
+}
+
+bool MenuOpen() {
+    return menu_open;
+}
 
 bool CapturesInput() {
-    return menu_open || text_entry_active;
-}
-
-void SetTextEntry(bool active, const std::string& prompt, const std::string& text) {
-    std::scoped_lock lock{imgui_mutex};
-    text_entry_active = active;
-    text_entry_prompt = prompt;
-    text_entry_text = text;
-}
-
-void ShowMouseCamera(bool enabled) {
-    std::scoped_lock lock{imgui_mutex};
-    mouse_toast_enabled = enabled;
-    mouse_toast_until = NowMs() + 2500;
+    // The text dialog too: keys typed into it (Backspace is the touchpad) stay out of the game.
+    return menu_open || prompt_active;
 }
 
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
@@ -1032,6 +1117,23 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     last_present = now;
     if (ms > 0.0f && ms < 1000.0f) {
         frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
+    }
+    // BB_FPS_PRINT=1: the present rate every 5 s on stdout, without the cost of BB_FRAME_STATS
+    // (its timers are in the draw path): to measure as players run the game.
+    static const bool fps_print = [] {
+        const char* env = std::getenv("BB_FPS_PRINT");
+        return env && env[0] == '1';
+    }();
+    if (fps_print) {
+        static auto window_start = now;
+        static std::uint64_t presents = 0;
+        ++presents;
+        if (const double s = std::chrono::duration<double>(now - window_start).count(); s >= 5.0) {
+            std::printf("Present rate: %.1f FPS over %.1f s\n", presents / s, s);
+            std::fflush(stdout);
+            window_start = now;
+            presents = 0;
+        }
     }
     if (std::getenv("BB_MENU_KEYS_FILE") && initialized) {
         std::scoped_lock lock{imgui_mutex};
@@ -1061,11 +1163,21 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if (BbSettings::Get().show_fps && !menu_open) {
         FpsCounter();
     }
-    if (text_entry_active) {
-        TextEntryBox();
+    if (prompt_active && !menu_open) {
+        TextPrompt();
     }
-    if (mouse_toast_until.load(std::memory_order_relaxed) > NowMs()) {
-        MouseCameraToast();
+    if (banner_active) {
+        std::string text;
+        {
+            std::scoped_lock banner_lock{banner_mutex};
+            text = banner_text;
+        }
+        const ImVec2 size = ImGui::CalcTextSize(text.c_str());
+        auto* draw = ImGui::GetForegroundDrawList();
+        const ImVec2 at{(io.DisplaySize.x - size.x) * 0.5f, io.DisplaySize.y * 0.82f};
+        draw->AddRectFilled({at.x - 24.0f, at.y - 12.0f}, {at.x + size.x + 24.0f, at.y + size.y + 12.0f},
+                            IM_COL32(0, 0, 0, 170), 6.0f);
+        draw->AddText(at, IM_COL32(230, 220, 200, 255), text.c_str());
     }
     ImGui::Render();
 
@@ -1090,3 +1202,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
 }
 
 } // namespace BbOverlay
+
+extern "C" void bbgpu_overlay_banner(const char* text) {
+    BbOverlay::SetBanner(text);
+}

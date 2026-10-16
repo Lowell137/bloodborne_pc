@@ -2,50 +2,6 @@
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
 mkdir -p out
-# Windows: MSYS2 CLANG64 (packages in packaging/windows/README.md). The GPU library is static
-# there and CMake links bb-probe.exe as well; no PGO (GCC-only flags), LTO off by default.
-case $(uname -s) in
-MINGW*|MSYS*)
-    # shellcheck source=msys2-env.sh
-    source ./msys2-env.sh
-    for tool in clang cmake ninja pkg-config; do
-        command -v "$tool" >/dev/null || { echo "Need $tool from MSYS2 CLANG64 (packaging/windows/README.md)." >&2; exit 1; }
-    done
-    if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ||
-          ! -f gpu/third_party/xbyak/xbyak/xbyak.h ]]; then
-        git submodule update --init --recursive
-    fi
-    for patch in gpu/patches/fsr-vulkan/*.patch; do
-        if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
-            git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
-        fi
-    done
-    cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO=off \
-        -DBB_LTO="${BB_LTO:-OFF}" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ >/dev/null
-    echo "GPU library and loader: LTO ${BB_LTO:-OFF}"
-    if ! ninja -C out/gpu bb-probe bb-gpu-capabilities bb-play > out/gpu-build.log 2>&1; then
-        grep -v '^\[' out/gpu-build.log | tail -40 >&2
-        echo 'Build failed (full log: out/gpu-build.log)' >&2; exit 1
-    fi
-    cp out/gpu/bb-probe.exe out/gpu/bb-gpu-capabilities.exe out/gpu/bb-play.exe out/
-    echo "Built $PWD/out/bb-probe.exe"
-    if [[ ${1:-} == --test ]]; then
-        # Exercise the optional bridge in the renderer tests when it was built.
-        if [[ -f out/bbport_dlss.dll && -f out/nvngx_dlss.dll ]]; then
-            cp out/bbport_dlss.dll out/nvngx_dlss.dll out/gpu/
-            if [[ -f out/nvngx_dlssg.dll ]]; then cp out/nvngx_dlssg.dll out/gpu/; fi
-        else
-            rm -f out/gpu/bbport_dlss.dll out/gpu/nvngx_dlss.dll out/gpu/nvngx_dlssg.dll
-        fi
-        ninja -C out/gpu bb-tests > out/test-build.log 2>&1 || {
-            tail -50 out/test-build.log >&2; exit 1;
-        }
-        ctest --test-dir out/gpu --output-on-failure
-        python -m unittest discover -s tests -p 'test_*.py'
-    fi
-    exit 0
-    ;;
-esac
 if [[ -z ${CC:-} ]]; then
     CC=$(command -v cc || command -v gcc || true)
     if [[ -z $CC ]]; then
@@ -78,13 +34,24 @@ mkdir -p pgo
 if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ]]; then
     git submodule update --init --recursive
 fi
-for patch in gpu/patches/fsr-vulkan/*.patch; do
-    if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
-        git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
-    fi
-done
-cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_PREFIX_PATH=/home/lowell/.local -DBB_PGO="$pgo" \
-    -DBB_LTO="${BB_LTO:-OFF}" -DBB_PGO_DIR="$PWD/pgo" >/dev/null
+# Issue #124: a checkout updated from an earlier version keeps that version's patch applied, and
+# the new one applies neither way ("patch does not apply"): the submodule's tree holds nothing but
+# these patches, so it is reset and they are applied again.
+fsr_patches_apply() {
+    for patch in gpu/patches/fsr-vulkan/*.patch; do
+        if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
+            git -C gpu/third_party/fsr-vulkan apply "$@" "$PWD/$patch" || return 1
+        fi
+    done
+}
+if ! fsr_patches_apply --check 2>/dev/null; then
+    echo 'FSR-Vulkan: an earlier version of the port changed it; resetting it and patching again'
+    git -C gpu/third_party/fsr-vulkan checkout -- .
+fi
+fsr_patches_apply
+cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
+    -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" > out/gpu-cmake.log
+grep '^-- Online module' out/gpu-cmake.log || true
 echo "GPU library: PGO $pgo, LTO ${BB_LTO:-ON}"
 # A failed GPU build must stop here: an older libbbgpu.so would otherwise be used silently.
 if ! ninja -C out/gpu bbgpu $(grep -q "^build bbnet:" out/gpu/build.ninja && echo bbnet) > out/gpu-build.log 2>&1; then
@@ -113,26 +80,12 @@ if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/l
     for source in "${atrac9[@]}"; do "$CC" -std=c99 -O2 -g -w -c "$source" -o "out/atrac9/$(basename "${source%.c}").o"; done
     ar rcs out/libatrac9.a out/atrac9/*.o
 fi
-if [[ -d gpu/third_party/dlss/include && -f gpu/third_party/dlss/lib/libnvsdk_ngx.a ]]; then
-    cmake -S gpu/dlss_bridge -B out/dlss-bridge -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DDLSS_SDK_ROOT="$PWD/gpu/third_party/dlss" -DVULKAN_INCLUDE=/usr/include >/dev/null 2>&1 || true
-    if ninja -C out/dlss-bridge >/dev/null 2>&1; then
-        cp -f out/dlss-bridge/libbbport_dlss.so gpu/third_party/dlss/lib/libnvidia-ngx*.so out/ 2>/dev/null || true
-        cp -f out/dlss-bridge/libbbport_dlss.so gpu/third_party/dlss/lib/libnvidia-ngx*.so out/gpu/ 2>/dev/null || true
-        mkdir -p bin bin/gpu
-        cp -f out/dlss-bridge/libbbport_dlss.so gpu/third_party/dlss/lib/libnvidia-ngx*.so bin/ 2>/dev/null || true
-        cp -f out/dlss-bridge/libbbport_dlss.so gpu/third_party/dlss/lib/libnvidia-ngx*.so bin/gpu/ 2>/dev/null || true
-    fi
-fi
 "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" -I. -Isrc src/probe.c "${runtime[@]}" src/vulkan_smoke.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/bb-probe
 echo "Built $PWD/out/bb-probe"
-mkdir -p bin bin/gpu
-cp -f out/bb-probe bin/bb-probe 2>/dev/null || true
-cp -f out/gpu/libbbgpu.so bin/gpu/libbbgpu.so 2>/dev/null || true
 # GPU check for run.sh (live_resolution=auto) and the launcher's gamepad list (--gamepads).
 "$CC" -std=c11 -O2 -Wall -Wextra -Werror "${includes[@]}" tools/gpu_capabilities.c "${libraries[@]}" -o out/bb-gpu-capabilities
 if [[ ${1:-} == --test ]]; then
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" -o out/pad-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" -lm -o out/pad-test
     out/pad-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/runtime-test
     out/runtime-test
