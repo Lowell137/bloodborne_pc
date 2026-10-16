@@ -18,18 +18,8 @@ inline bool IsFsr4(int upscaler) {
     return upscaler == UpscalerFsr4 || upscaler == UpscalerFsr411;
 }
 enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, PresetCount };
-
-/// Native NGX model hint values, independent of the render-resolution preset.
-inline constexpr int DlssPresets[] = {0, 1, 2, 3, 4, 5, 6, 10, 11, 13, 12};
-inline constexpr int DlssPresetCount = sizeof(DlssPresets) / sizeof(DlssPresets[0]);
 enum DebugView : int { DebugNone = 0, DebugReactive = 1, DebugMotion = 2, DebugViewCount };
 enum class MenuLanguage { English, Russian };
-enum FrameGeneration : int {
-    FrameGenerationOff,
-    FrameGenerationFsr,
-    FrameGenerationDlss,
-    FrameGenerationCount
-};
 
 /// Game effects switched by the community patches at start (patches.py EFFECTS): ini key,
 /// menu label, default (the game's own behaviour).
@@ -50,16 +40,6 @@ inline constexpr Effect Effects[] = {
     {"skip_intro", "Skip startup intros", "Пропуск заставок при запуске", false},
     {"debug_camera", "Free camera (Cross + L3)", "Свободная камера (Cross + L3)", false},
     {"debug_menu", "Debug menu (requires font files)", "Debug menu (нужны файлы шрифтов)", false},
-    {"cheat_no_death", "Never die (minimum 1 HP)", "Чит: бессмертие (не ниже 1 HP)", false},
-    {"cheat_stealth", "Enemies do not see you", "Чит: враги не замечают", false},
-    {"cheat_silent", "Silent footsteps", "Чит: враги не слышат", false},
-    {"cheat_rally_no_decay", "Rally does not decay", "Чит: Rally не угасает", false},
-    {"cheat_enemy_control", "Control enemies (R3 / L3)", "Чит: управление врагом (R3 / L3)", false},
-    {"tweak_no_rally", "Disable Rally", "Без Rally (возврата HP)", false},
-    {"tweak_camera_distance", "Camera distance", "Камера дальше", false},
-    {"tweak_no_camera_rotation", "Disable automatic camera rotation", "Без автоповорота камеры", false},
-    {"tweak_easy_run", "Run with less stick tilt", "Бег с меньшим наклоном стика", false},
-    {"tweak_ragdoll", "Dark Souls ragdoll physics", "Физика тел как в Dark Souls", false},
 };
 inline constexpr int EffectCount = int(sizeof(Effects) / sizeof(Effects[0]));
 /// Output aspect ratios, and the output resolutions of each: the upscaler's output and the UI's
@@ -109,12 +89,6 @@ struct Values {
     std::atomic<bool> menu_language_chosen{false};
     std::atomic<int> upscaler{UpscalerFsr3};
     std::atomic<int> preset{NativeAA};
-    std::atomic<int> dlss_preset{0}; ///< 0 = DLL default; otherwise an NGX model preset
-    std::atomic<int> frame_generation{FrameGenerationOff};
-    std::atomic<bool> fsr_fg_supported{false}, dlss_fg_supported{false};
-    std::atomic<const char *> frame_generation_problem{nullptr};
-    std::atomic<bool> frame_generation_active{false};
-    std::atomic<float> frame_generation_render_ms{0};
     std::atomic<bool> sharpen{true};
     std::atomic<float> sharpness{0.3f};
     std::atomic<bool> jitter{true};
@@ -125,8 +99,6 @@ struct Values {
     std::atomic<float> reactive_max{0.9f};
     std::atomic<int> debug_view{DebugNone};
     std::atomic<bool> show_fps{false};
-    std::atomic<bool> mouse_camera{false}, mouse_invert_y{false};
-    std::atomic<float> mouse_sensitivity{100.f}; // percent; 100 = 900 counts/radian
     /// The settings menu's position (fraction of the screen), -1 until it is moved.
     std::atomic<float> menu_x{-1.0f}, menu_y{-1.0f};
     // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.
@@ -151,7 +123,7 @@ struct Values {
     /// Why FSR 4 cannot run (assets, device features), or null. Set by the renderer.
     std::atomic<const char*> fsr4_problem{nullptr};
     std::atomic<bool> fsr4_supported{false}, fsr411_supported{false};
-    /// DLSS (bbport_dlss.dll, NVIDIA RTX) is ready, or why not (null before the device exists).
+    /// DLSS (gpu/dlss_bridge, NVIDIA RTX) is ready, or why not (null before the device exists).
     std::atomic<bool> dlss_supported{false};
     std::atomic<const char*> dlss_problem{nullptr};
 
@@ -186,8 +158,6 @@ void Save();
 /// Render resolution divisor of a preset (1.0 native, 1.5 quality, ...).
 float PresetScale(int preset);
 const char* PresetName(int preset);
-const char* DlssPresetName(int preset);
-const char* DlssPresetLabel(int preset);
 const char* UpscalerName(int upscaler);
 
 } // namespace BbSettings
